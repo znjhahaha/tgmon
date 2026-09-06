@@ -111,7 +111,7 @@ def _ctx() -> dict:
         "include_dups": settings.get("QQ_INCLUDE_DUPS"),
         "daily_limit": settings.get("QQ_DAILY_LIMIT"),
         "groups": groups, "recent": recent, "channels": channels,
-        "callback_url": (outputs.base_url() or "https://tg.hidisiwa.xyz")
+        "callback_url": (outputs.base_url() or "https://tgmon.example.com")
                         + "/qqbot/callback",
         "bridge_online": bridge_online, "bridge_seen": bridge_seen,
         "bridge_token_set": bool(str(settings.get("QQ_BRIDGE_TOKEN") or "")),
@@ -199,7 +199,7 @@ async def selfcheck(request: Request, user: str = Depends(require_admin)):
     return HTMLResponse(
         f"<div class='flash ok'>密钥有效，已换到 access_token。"
         f"公钥指纹 <code>{fp}</code>（与日志 op13 应答里的 pubfp 应一致），"
-        f"回调地址 <code>{outputs.base_url() or 'https://tg.hidisiwa.xyz'}"
+        f"回调地址 <code>{outputs.base_url() or 'https://tgmon.example.com'}"
         f"/qqbot/callback</code></div>")
 
 

@@ -2,22 +2,25 @@
 	admin off
 	# 没带 SNI 的连接（例如直接用 IP 访问）用哪本证书。
 	# 不设这个的话 `tls internal` 不知道该给谁签，握手直接 internal error。
-	default_sni 69.33.211.94
+	default_sni {$TGMON_IP:127.0.0.1}
 }
 
 # ---------------------------------------------------------------
-# 主入口：tg.hidisiwa.xyz。Caddy 自动申请 Let's Encrypt 真证书（HTTP-01），
-# 并自动附带 HTTP→HTTPS 跳转与 ACME 挑战路由，不用手写 :80 块。
+# 主入口：对外域名，取自 .env 的 TGMON_DOMAIN（应与 TGMON_BASE_URL 的
+# 主机名一致）。Caddy 自动申请 Let's Encrypt 真证书（HTTP-01），并自动
+# 附带 HTTP→HTTPS 跳转与 ACME 挑战路由，不用手写 :80 块。
 #
-# 前提：A 记录指向 69.33.211.94，且 CF 代理先关（灰云）。
+# 前提：A 记录指向服务器 IP，且 CF 代理先关（灰云）。
 # 之后想翻橙云：源站此时已有真证书，CF 的 SSL/TLS 模式可以直接选最严的
 # Full (strict)，不用中途降级。
+#
+# 没有域名时保持默认 localhost 即可本地开发（自签证书）。
 # ---------------------------------------------------------------
-tg.hidisiwa.xyz {
+{$TGMON_DOMAIN:localhost} {
 	encode zstd gzip
 
 	# 有真证书了才敢开 HSTS。不加 includeSubDomains ——
-	# 同域下 www 是你的 Pages 站，别牵连它
+	# 避免牵连同域下其他子域服务
 	header Strict-Transport-Security "max-age=15552000"
 	header X-Content-Type-Options "nosniff"
 	header X-Frame-Options "DENY"
@@ -45,9 +48,10 @@ tg.hidisiwa.xyz {
 
 # ---------------------------------------------------------------
 # IP 访问：保留自签，作为域名没生效或 DNS 出问题时的后备通道。
-# 浏览器会警告 —— 正常，公共 CA 不签裸 IP。
+# 地址取自 .env 的 TGMON_IP。浏览器会警告 —— 正常，公共 CA 不签裸 IP。
+# 不需要 IP 直连可以整块删除。
 # ---------------------------------------------------------------
-https://69.33.211.94, https://localhost {
+https://{$TGMON_IP:127.0.0.1} {
 	tls internal
 
 	encode zstd gzip
@@ -67,8 +71,8 @@ https://69.33.211.94, https://localhost {
 }
 
 # IP 的 HTTP 请求跳 HTTPS。
-# 注意：不要写裸 `:80` 全局块 —— 那会抢掉 Caddy 给 tg.hidisiwa.xyz 自动装的
+# 注意：不要写裸 `:80` 全局块 —— 那会抢掉 Caddy 给域名自动装的
 # ACME 挑战路由，导致证书永远申请不下来。域名的跳转 Caddy 已自动处理。
-http://69.33.211.94 {
+http://{$TGMON_IP:127.0.0.1} {
 	redir https://{host}{uri} permanent
 }

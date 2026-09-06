@@ -46,6 +46,10 @@ services:
     ports:
       - "0.0.0.0:80:80"
       - "0.0.0.0:443:443"
+    # 站点地址来自 .env（见 Caddyfile）；未配置时退化为 localhost，本地开发可用
+    environment:
+      TGMON_DOMAIN: ${TGMON_DOMAIN:-localhost}
+      TGMON_IP: ${TGMON_IP:-127.0.0.1}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/data:/data

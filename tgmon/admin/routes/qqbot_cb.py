@@ -1,6 +1,6 @@
 """腾讯事件回调端点 —— QQ 开放平台 Webhook 模式的入口。
 
-q.qq.com 管理端配置回调地址为 https://tg.hidisiwa.xyz/qqbot/callback。
+q.qq.com 管理端配置回调地址为 <对外地址>/qqbot/callback。
 免登录（腾讯不携带我们的会话 cookie），但除 op=13 握手外每笔请求都验签。
 
 两种请求：

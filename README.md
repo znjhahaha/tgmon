@@ -1,5 +1,9 @@
 # tgmon
 
+[![CI](https://github.com/znjhahaha/tgmon/actions/workflows/docker.yml/badge.svg)](https://github.com/znjhahaha/tgmon/actions/workflows/docker.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](LICENSE)
+[![image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/znjhahaha/tgmon/pkgs/container/tgmon)
+
 Telegram 游戏爆料频道监控与分发系统：用户账号抓取 → 游戏识别 → 术语化翻译 → 三层去重，经 RSS、HTTP API、Webhook 与 QQ 机器人对外输出。
 
 系统面向单机、低带宽跨境链路场景设计：全部计算密集型工作（抓取、媒体处理、翻译、向量化）在一台海外 VPS 上完成，对外只输出轻量文本与缩略图。当前用于监控原神、崩坏：星穹铁道、绝区零相关爆料频道。
@@ -93,15 +97,14 @@ worker  独占用户会话，执行抓取管线并消费任务队列
 
 ### 镜像部署（推荐）
 
-镜像由 GitHub Actions 自动构建并发布到 `ghcr.io`。每次 push 到 main 更新 `latest`，打 `v*` tag 另发版本号镜像，同时保留 `sha` 快照便于回滚。
+镜像由 GitHub Actions 自动构建并发布到 `ghcr.io`，与仓库同为公开，拉取无需登录。每次 push 到 main 更新 `latest`，打 `v*` tag 另发版本号镜像，同时保留 `sha` 快照便于回滚。
 
 ```bash
-# 私有仓库先准备 PAT（repo + read:packages 权限），公开仓库跳过
-export GH_PAT=<你的 GitHub PAT>
-
-git clone https://$GH_PAT@github.com/znjhahaha/tgmon.git /opt/tgmon
+git clone https://github.com/znjhahaha/tgmon.git /opt/tgmon
 cd /opt/tgmon && ./deploy.sh
 ```
+
+使用私有镜像仓库部署时，先 `export GH_PAT=<GitHub PAT，repo + read:packages 权限>` 再执行上述命令。
 
 `deploy.sh` 自动生成 `.env` 与随机后台密码、拉取镜像、启动容器并做健康检查。此后更新版本只需：
 
@@ -136,7 +139,7 @@ docker compose up -d --build
 
 ### 环境变量
 
-只有以下变量需要写在 `.env`（它们在数据库可用之前就要读取），其余全部在网页后台配置：
+以下变量写在 `.env`：应用启动参数、Caddy 反向代理的站点配置与功能默认开关。其余全部配置在网页后台修改：
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
@@ -144,6 +147,8 @@ docker compose up -d --build
 | `TGMON_ADMIN_PASSWORD` | 首次部署 | — | 后台初始密码，建号后可在网页改密并清空此行 |
 | `TGMON_BASE_URL` | 是 | — | 对外地址（域名或 IP），RSS 绝对链接与 Webhook 回调使用 |
 | `TGMON_LOG_LEVEL` | 否 | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` |
+| `TGMON_DOMAIN` | 有域名时 | `localhost` | 对外域名（Caddy 反代站点），与 `TGMON_BASE_URL` 的主机名保持一致 |
+| `TGMON_IP` | 否 | `127.0.0.1` | IP 直连回退入口（自签证书），仅需要绕过 DNS 时设置 |
 | `TGMON_RETRIEVAL_ENABLED` | 否 | `true` | 消息混合检索开关 |
 | `TGMON_EMBEDDING_ENABLED` | 否 | `true` | 本地 embedding 开关 |
 | `TGMON_MEMORY_ENABLED` | 否 | `true` | QQ 对话记忆开关 |
@@ -361,3 +366,10 @@ tgmon/
 ├── unified_migration.py    幂等数据迁移
 └── db.py settings.py crypto.py models.py paths.py util.py lang.py    基础设施
 ```
+
+## 许可证
+
+[MIT](LICENSE)。欢迎通过 [Issue](https://github.com/znjhahaha/tgmon/issues) 与 Pull Request 反馈问题与改进。
+
+内置第三方资源遵循各自上游许可证：[htmx](https://htmx.org)（Zero-Clause BSD）、[Noto Sans SC](https://fonts.google.com/noto/specimen/Noto+Sans+SC) 字体（SIL Open Font License 1.1）。
+

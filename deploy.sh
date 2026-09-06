@@ -2,7 +2,7 @@
 # tgmon 一键部署 / 更新（生产，跑 ghcr 预构建镜像）。
 #
 # 全新机器首次部署：
-#   git clone https://<token>@github.com/znjhahaha/tgmon.git /opt/tgmon
+#   git clone https://github.com/znjhahaha/tgmon.git /opt/tgmon
 #   cd /opt/tgmon && ./deploy.sh
 #
 # 以后更新版本：
@@ -35,7 +35,8 @@ if [ "$MODE" = "install" ]; then
     echo "=========================================================="
     echo " 已生成 .env，后台初始密码：$PASS"
     echo " （登录后请到网页改密码，然后可清空 .env 里这行）"
-    echo " 记得把 TGMON_BASE_URL 改成你的实际域名/IP"
+    echo " 记得把 TGMON_BASE_URL 和 TGMON_DOMAIN 改成实际域名"
+    echo " （需要 IP 直连备援再设 TGMON_IP，见 .env 注释）"
     echo "=========================================================="
   fi
 fi
@@ -44,6 +45,18 @@ fi
 mkdir -p db sessions media logs caddy/data caddy/config
 
 if [ "$MODE" = "update" ]; then
+  # 一次性迁移：把旧版 Caddyfile 里写死的域名/IP 提取进 .env
+  #（新版 Caddyfile 改为读 TGMON_DOMAIN / TGMON_IP 环境变量）
+  if [ -f .env ] && [ -f Caddyfile ] && ! grep -q '^TGMON_DOMAIN=' .env; then
+    _domain=$(grep -oE '^[a-z0-9.-]+\.[a-z]{2,}[[:space:]]*\{' Caddyfile | head -1 | tr -d ' {')
+    _ip=$(grep -oE 'default_sni[[:space:]]+[0-9.]+' Caddyfile | awk '{print $2}' | head -1)
+    if [ -n "$_domain" ] || [ -n "$_ip" ]; then
+      echo "" >> .env
+      if [ -n "$_domain" ]; then echo "TGMON_DOMAIN=$_domain" >> .env; fi
+      if [ -n "$_ip" ]; then echo "TGMON_IP=$_ip" >> .env; fi
+      echo "=== 已把旧 Caddyfile 的站点地址迁移进 .env（TGMON_DOMAIN / TGMON_IP） ==="
+    fi
+  fi
   echo "=== 拉取最新代码与镜像 ==="
   git pull --ff-only
 fi
