@@ -1,0 +1,274 @@
+{% extends "base.html" %}
+{% block title %}消息浏览 · tgmon{% endblock %}
+{% block body %}
+<h1>消息浏览</h1>
+<p class="sub">共 {{ total }} 条，第 {{ page }} / {{ pages }} 页。</p>
+
+<div class="card">
+  <form method="get" action="/messages" class="inline">
+    <label>频道<select name="channel_id">
+      <option value="">全部</option>
+      {% for c in channels %}
+      <option value="{{ c.id }}" {{ 'selected' if channel_id==c.id }}>{{ c.title }}</option>
+      {% endfor %}
+    </select></label>
+    <label>游戏<select name="game">
+      <option value="">全部</option>
+      {% for g in game_options %}
+      <option value="{{ g }}" {{ 'selected' if game==g }}>{{ g }}</option>
+      {% endfor %}
+    </select></label>
+    <label>关键词<input name="q" value="{{ q }}" placeholder="原文或译文"></label>
+    <label>内容类型<select name="topic">
+      <option value="">全部</option>
+      {% for t in topic_options %}
+      <option value="{{ t }}" {{ 'selected' if topic==t }}>{{ t }}</option>
+      {% endfor %}
+    </select></label>
+    <label>版本<input name="version" value="{{ version }}" placeholder="如 7.1"
+                     style="min-width:70px"></label>
+    <label>重复<select name="dup">
+      <option value="hide" {{ 'selected' if dup=='hide' }}>只看首发</option>
+      <option value="" {{ 'selected' if dup=='' }}>全部</option>
+      <option value="only" {{ 'selected' if dup=='only' }}>只看重复</option>
+    </select></label>
+    <label>翻译状态<select name="status">
+      <option value="">全部</option>
+      {% for st in ['ok','failed','skipped','disabled','budget','pending'] %}
+      <option value="{{ st }}" {{ 'selected' if status==st }}>{{ st }}</option>
+      {% endfor %}
+    </select></label>
+    <button class="btn">筛选</button>
+  </form>
+</div>
+
+<div class="card">
+  {% for m in messages %}
+  <div class="msg" id="m-{{ m.id }}">
+    <div class="head">
+      {% if role != 'guest' %}
+      <input type="checkbox" class="msg-check" value="{{ m.id }}"
+             data-media="{{ m.media|length }}"
+             style="flex:none;align-self:center;margin:0 2px 0 0"
+             onchange="bulkBarUpdate()">
+      {% endif %}
+      <b style="color:var(--fg)">{{ m.channel }}</b>
+      <span>{{ m.published_at|fmt_local }}</span>
+      {% if m.translate_status == 'ok' %}
+        <span class="tag ok">已译{% if m.from_cache %}·缓存{% endif %}</span>
+      {% elif m.translate_status == 'skipped_zh' %}
+        <span class="tag ok">原文中文·零调用</span>
+      {% elif m.translate_status == 'skipped' %}
+        <span class="tag">纯媒体·零调用</span>
+      {% elif m.translate_status == 'failed' %}
+        <span class="tag err">翻译失败</span>
+      {% elif m.translate_status == 'budget' %}
+        <span class="tag warn">预算拦截</span>
+      {% elif m.translate_status == 'disabled' %}
+        <span class="tag">该频道关了翻译</span>
+      {% else %}<span class="tag">{{ m.translate_status }}</span>{% endif %}
+      {% if m.game_detected %}<span class="tag ok">{{ m.game_detected }}</span>{% endif %}
+      {% if m.version_tag %}<span class="tag">v{{ m.version_tag }}</span>{% endif %}
+      {% for t in m.topics %}<span class="tag">{{ t }}</span>{% endfor %}
+      {% if m.duplicate_of %}
+        <span class="tag warn">重复（{{ m.dup_reason }}）→ #{{ m.duplicate_of }}</span>
+      {% endif %}
+      {% if m.has_spoiler %}<span class="tag warn">剧透</span>{% endif %}
+      {% for g in m.glossary_miss %}<span class="tag warn">漏译 {{ g }}</span>{% endfor %}
+      {% for e in m.entities %}<span class="tag ok">{{ e.name }}</span>{% endfor %}
+      {% if m.lang_detected %}<span class="tag">{{ m.lang_detected }}</span>{% endif %}
+      {% if m.cost %}<span class="dim">¥{{ '%.4f'|format(m.cost) }}</span>{% endif %}
+      <span class="spacer"></span>
+      {% if m.deeplink %}<a href="{{ m.deeplink }}" target="_blank" rel="noreferrer">{{ '在 TG 打开' if m.deeplink.startswith('https://t.me/') else '打开原页面' }}</a>{% endif %}
+    </div>
+
+    {% if m.media %}
+    <div class="row" style="margin-bottom:6px">
+      {% for x in m.media %}
+        {% if x.thumb %}
+        {% if x.kind == 'video' and x.video_status == 'ok' and x.video_path %}
+          <img class="thumb thumb-m{{ ' spoiler' if x.has_spoiler }}" loading="lazy"
+               src="/media/{{ x.thumb }}" alt="视频首帧"
+               data-video="/media/private/{{ x.video_path }}"
+               data-tg="{{ m.deeplink or '' }}"
+               {{ 'data-spoil=1' if x.has_spoiler }}
+               title="点击播放{{ '（剧透，先模糊）' if x.has_spoiler }}">
+        {% else %}
+          <img class="thumb thumb-m{{ ' spoiler' if x.has_spoiler }}" loading="lazy"
+               src="/media/{{ x.thumb }}" alt="{{ '视频首帧' if x.kind=='video' else '图片' }}"
+               data-img="/media/{{ x.thumb }}"
+               data-tg="{{ m.deeplink or '' }}"
+               {{ 'data-spoil=1' if x.has_spoiler }}
+               title="点击预览大图{{ '（剧透，先模糊）' if x.has_spoiler }}">
+        {% endif %}
+        {% endif %}
+      {% endfor %}
+    </div>
+    <div class="row" style="margin-top:2px">
+      {% for x in m.media %}
+      <span class="dim" style="font-size:12px">
+        {{ x.kind }}{% if x.width %} {{ x.width }}×{{ x.height }}{% endif %}
+        {% if x.duration %} · {{ x.duration }}s{% endif %}
+        {% if x.orig_bytes %} · 原始 {{ x.orig_bytes|human_bytes }}{% endif %}
+        {% if x.kind == 'video' %}
+          {% if x.video_status == 'ok' and x.video_path %}
+            · 已归档（{{ x.video_bytes|human_bytes }}），点缩略图播放
+          {% elif x.video_status %}
+            · 归档{{ x.video_status }}
+          {% else %}
+            · 点缩略图可看预览
+          {% endif %}
+        {% endif %}
+      </span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if m.zh_segments %}
+    <div class="zh">{% for seg, sp in m.zh_segments %}{% if sp %}<span class="spoiler">{{ seg }}</span>{% else %}{{ seg }}{% endif %}{% endfor %}</div>
+    {% elif m.text_zh %}
+    <div class="zh">{{ m.text_zh }}</div>
+    {% elif m.translate_error %}
+    <div class="flash err" style="font-size:12px">{{ m.translate_error|truncate_text(300) }}</div>
+    {% endif %}
+
+    {% if m.has_spoiler and not m.zh_segments %}
+    <p class="hint">这条带剧透段，但译文经过模型重写、区间无法对齐 ——
+      原文区（下方）能看到精确的剧透范围。</p>
+    {% endif %}
+
+    {% if m.text_raw %}
+    <details>
+      <summary>原文{% if m.spoiler_ranges %}（含 {{ m.spoiler_ranges|length }} 段剧透，模糊处点击揭开）{% endif %}</summary>
+      {% if m.raw_segments %}
+      <pre>{% for seg, sp in m.raw_segments %}{% if sp %}<span class="spoiler">{{ seg }}</span>{% else %}{{ seg }}{% endif %}{% endfor %}</pre>
+      {% else %}
+      <pre>{{ m.text_raw }}</pre>
+      {% endif %}
+    </details>
+    {% endif %}
+
+    <div class="row" style="margin-top:6px">
+      {% if role != 'guest' %}
+      <button class="btn sm ghost" hx-post="/messages/{{ m.id }}/retranslate"
+              hx-target="#act-{{ m.id }}" hx-swap="innerHTML"
+              hx-indicator="#rt-{{ m.id }}">重新翻译</button>
+      <span id="rt-{{ m.id }}" class="htmx-indicator">调用中…</span>
+      <button class="btn sm ghost" hx-post="/messages/{{ m.id }}/repush"
+              hx-target="#act-{{ m.id }}" hx-swap="innerHTML">手动重推</button>
+      {% if m.duplicate_of %}
+      <button class="btn sm ghost" hx-post="/messages/{{ m.id }}/unmark-dup"
+              hx-target="#act-{{ m.id }}" hx-swap="innerHTML">误判·放行</button>
+      {% endif %}
+      <form hx-post="/messages/{{ m.id }}/share" hx-target="#share-box-{{ m.id }}"
+            hx-swap="innerHTML" style="display:flex;gap:4px;align-items:center;margin:2px 0;flex-wrap:wrap">
+        <select name="expires" style="width:auto;padding:3px 6px;font-size:12px;margin:0">
+          <option value="24h">24h</option>
+          <option value="48h" selected>48h</option>
+          <option value="7d">7天</option>
+          <option value="30d">30天</option>
+        </select>
+        <button class="btn sm ghost" hx-indicator="#sh-{{ m.id }}">分享</button>
+        <span id="sh-{{ m.id }}" class="htmx-indicator" style="font-size:12px">概括生成中…</span>
+        <span class="dim" style="font-size:11px">AI 概括自动生成</span>
+      </form>
+      {% endif %}
+      <button class="btn sm ghost" hx-get="/messages/{{ m.id }}/detail"
+              hx-target="#detail-{{ m.id }}" hx-swap="innerHTML">详情</button>
+      <span id="act-{{ m.id }}" style="font-size:12px"></span>
+    </div>
+    <div id="detail-{{ m.id }}"></div>
+    <div id="share-box-{{ m.id }}">{{ m.share_links_html|safe }}</div>
+  </div>
+  {% else %}
+  <p class="dim">
+    没有消息。如果刚配好，去<a href="/channels">频道管理</a>勾选频道，
+    或用「补最近 20 条历史」立刻验证管线。
+  </p>
+  {% endfor %}
+</div>
+
+{% if pages > 1 %}
+{% set qs = '&channel_id=' ~ (channel_id or '') ~ '&q=' ~ q ~ '&dup=' ~ dup ~ '&status=' ~ status ~ '&topic=' ~ topic ~ '&version=' ~ version ~ '&game=' ~ game %}
+<div class="pager">
+  {% if page > 1 %}<a href="/messages?page={{ page-1 }}{{ qs }}">上一页</a>{% endif %}
+  <span class="dim">{{ page }} / {{ pages }}</span>
+  {% if page < pages %}<a href="/messages?page={{ page+1 }}{{ qs }}">下一页</a>{% endif %}
+</div>
+{% endif %}
+
+{% if role != 'guest' and messages %}
+{# ---- 多选批量操作栏（2026-09 升级）：勾选消息后浮动出现 ---- #}
+<div id="bulk-bar" style="display:none;position:fixed;bottom:0;left:0;right:0;
+     z-index:40;background:var(--panel);border-top:1px solid var(--line);
+     padding:10px 16px;display:none;flex-wrap:wrap;gap:8px;align-items:center">
+  <b id="bulk-count" style="font-size:13px">已选 0 条</b>
+  <span id="bulk-meta" class="dim" style="font-size:12px"></span>
+  <button class="btn sm ghost" onclick="bulkSelectAll(true)">全选本页</button>
+  <button class="btn sm ghost" onclick="bulkSelectFiltered()">全选筛选结果（最多50）</button>
+  <button class="btn sm ghost" onclick="bulkPreview()">预览选择</button>
+  <button class="btn sm ghost" onclick="bulkSelectAll(false)">清空</button>
+  <span style="flex:1"></span>
+  <select id="bulk-expires" style="width:auto;padding:4px 6px;font-size:12px">
+    <option value="24h">24h</option>
+    <option value="48h" selected>48h</option>
+    <option value="7d">7天</option>
+    <option value="30d">30天</option>
+  </select>
+  <button class="btn sm" onclick="bulkSubmit('/messages/bulk-share')">合并分享</button>
+  <button class="btn sm ghost" onclick="bulkSubmit('/messages/bulk-repush')">批量重推</button>
+  <button class="btn sm ghost" onclick="bulkSubmit('/messages/bulk-unmark-dup')">误判放行</button>
+</div>
+<div id="bulk-result" style="position:fixed;bottom:64px;left:50%;transform:translateX(-50%);
+     z-index:41;max-width:90%"></div>
+
+<script>
+function bulkChecked() {
+  var key = "tgmon-bulk-selection";
+  var saved = JSON.parse(localStorage.getItem(key) || "[]");
+  document.querySelectorAll(".msg-check:checked").forEach(function(c){ if(saved.indexOf(c.value)<0) saved.push(c.value); });
+  localStorage.setItem(key, JSON.stringify(saved.slice(-50)));
+  return saved.slice(-50);
+}
+function bulkBarUpdate() {
+  var ids = bulkChecked(), bar = document.getElementById("bulk-bar");
+  bar.style.display = ids.length ? "flex" : "none";
+  document.getElementById("bulk-count").textContent = "已选 " + ids.length + " 条";
+  var visible=0; document.querySelectorAll('.msg-check:checked').forEach(function(c){visible += Number(c.dataset.media||0)});
+  document.getElementById('bulk-meta').textContent = ids.length ? ('· 本页图片 '+visible+' 张 · 预计 '+Math.max(1,Math.ceil(ids.length/10))+' 页') : '';
+}
+function bulkSelectAll(on) {
+  var key="tgmon-bulk-selection", saved=on?JSON.parse(localStorage.getItem(key)||"[]"):[];
+  document.querySelectorAll(".msg-check").forEach(function (c) { c.checked = on; var i=saved.indexOf(c.value); if(on&&i<0)saved.push(c.value); if(!on&&i>=0)saved.splice(i,1); });
+  localStorage.setItem(key,JSON.stringify(saved.slice(-50)));
+  bulkBarUpdate();
+}
+function bulkSelectFiltered() {
+  var p=new URLSearchParams(location.search); fetch('/messages/select-ids?'+p.toString(),{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){localStorage.setItem('tgmon-bulk-selection',JSON.stringify((d.ids||[]).map(String).slice(0,50))); document.querySelectorAll('.msg-check').forEach(function(c){c.checked=(d.ids||[]).map(String).indexOf(c.value)>=0}); var box=document.getElementById('bulk-result'); box.textContent='已选 '+(d.count||0)+' 条 · 图片 '+(d.image_count||0)+' 张 · 预计 '+(d.estimated_pages||0)+' 页'; box.style.display='block'; bulkBarUpdate();});
+}
+function bulkPreview(){ var ids=bulkChecked(); var box=document.getElementById('bulk-result'); box.textContent=ids.length?'已选消息：#'+ids.join('、#'):'暂无选择'; box.style.display='block'; }
+function bulkSubmit(url) {
+  var ids = bulkChecked();
+  if (!ids.length) return;
+  var fd = new FormData();
+  fd.append("ids", JSON.stringify(ids));
+  var exp = document.getElementById("bulk-expires");
+  if (url.indexOf("bulk-share") >= 0) fd.append("expires", exp.value);
+  fetch(url, {method: "POST", body: fd, credentials: "same-origin"})
+    .then(function (r) { return r.text(); })
+    .then(function (html) {
+      var box = document.getElementById("bulk-result");
+      box.innerHTML = html;
+      box.style.display = "block";
+      if (url.indexOf("bulk-share") >= 0) localStorage.removeItem("tgmon-bulk-selection");
+      // 链接生成/放行后刷新页面（重推任务异步，提示即可不刷）
+      if (url.indexOf("bulk-share") < 0) setTimeout(function(){ location.reload(); }, 1500);
+    });
+}
+document.querySelectorAll('.msg-check').forEach(function(c){var ids=JSON.parse(localStorage.getItem('tgmon-bulk-selection')||'[]');c.checked=ids.indexOf(c.value)>=0;c.addEventListener('change',function(){var a=JSON.parse(localStorage.getItem('tgmon-bulk-selection')||'[]'),i=a.indexOf(c.value);if(c.checked&&i<0){if(a.length>=50){c.checked=false;var box=document.getElementById('bulk-result');box.textContent='一次最多选择50条消息';box.style.display='block';return;}a.push(c.value);}if(!c.checked&&i>=0)a.splice(i,1);localStorage.setItem('tgmon-bulk-selection',JSON.stringify(a));bulkBarUpdate()});});
+bulkBarUpdate();
+// 分享概括 2026-09 起后端自动生成（AI 覆盖全部内容，失败降级正文首行），
+// 原「AI 概括」按钮与手填输入框已移除 —— 这里不再需要前端 JS。
+</script>
+{% endif %}
+{% endblock %}

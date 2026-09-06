@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ ('%d 条消息' % items|length) if items|length > 1 else m.channel }} · 分享 · tgmon</title>
+<link rel="icon" href="data:,">
+<meta name="robots" content="noindex">
+<style>
+/* 独立页面：不继承后台 base（无导航、无状态条、无其它消息入口）。
+   配色沿用后台，保持观感一致 */
+:root{--bg:#0f1115;--panel:#171a21;--line:#2a2f3a;--fg:#e6e8ec;
+--dim:#9aa3b2;--acc:#4d9fff;--warn:#f0b429}
+@media(prefers-color-scheme:light){:root{--bg:#f6f7f9;--panel:#fff;
+--line:#dfe3e8;--fg:#1a1d23;--dim:#666e7d;--acc:#0b62d0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.7 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:24px 16px 60px}
+.head{color:var(--dim);font-size:13px;margin-bottom:10px;display:flex;
+gap:10px;flex-wrap:wrap;align-items:center}
+.head b{color:var(--fg)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+padding:18px 20px;margin-bottom:14px}
+.zh{white-space:pre-wrap;word-break:break-word}
+details{margin-top:12px}
+summary{cursor:pointer;color:var(--acc);font-size:13px}
+pre{background:rgba(0,0,0,.18);padding:12px;border-radius:8px;
+white-space:pre-wrap;word-break:break-word;font-size:13.5px;margin:8px 0}
+.tag{display:inline-block;background:rgba(255,255,255,.08);color:var(--dim);
+border-radius:4px;padding:1px 8px;font-size:12px;margin:2px 4px 2px 0}
+.media{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.media img,.media video{max-width:100%;max-height:480px;border-radius:8px;
+border:1px solid var(--line);display:block}
+.dl-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;font-size:13px}
+.dl-row a{color:var(--acc)}
+.foot{color:var(--dim);font-size:12px;text-align:center;margin-top:28px}
+.spoiler{filter:blur(6px);cursor:pointer;transition:filter .15s;border-radius:3px}
+img.spoiler,video.spoiler{filter:blur(14px)}
+.spoiler.revealed{filter:none;cursor:auto}
+.warn-tag{color:var(--warn);font-size:12px}
+.batch{display:flex;gap:10px;align-items:baseline;margin-bottom:14px;
+color:var(--dim);font-size:13px}
+.batch b{color:var(--fg);font-size:15px}
+.share-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+.share-actions a,.share-actions button{font:inherit;color:var(--acc);background:transparent;border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;text-decoration:none}
+.share-actions button:hover,.share-actions a:hover{border-color:var(--acc)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  {% if summary %}
+  <div class="card" style="border-left:3px solid var(--acc)">
+    <div style="font-size:17px;font-weight:600">{{ summary }}</div>
+    <textarea id="share-copy" hidden>{{ copy_text }}</textarea>
+    <div class="share-actions">
+      <button type="button" onclick="copyShareText('share-copy',this)">复制分享文案</button>
+      <a href="/s/{{ share_token }}/card" target="_blank">预览长图</a>
+      <a href="/s/{{ share_token }}/card?dl=1">下载单页 JPEG</a>
+      <a href="/s/{{ share_token }}/card.zip">下载全部页面 ZIP</a>
+    </div>
+  </div>
+  {% endif %}
+  {% if items|length > 1 %}
+  <div class="batch">
+    <b>分享合集</b>
+    <span>共 {{ items|length }} 条消息</span>
+  </div>
+  {% endif %}
+
+  {% for m in items %}
+  <div class="head">
+    <b>{{ m.channel }}</b>
+    <span>{{ m.published_at.strftime('%Y-%m-%d %H:%M') }} (UTC)</span>
+    {% if m.game_detected %}<span class="tag">{{ m.game_detected }}</span>{% endif %}
+    {% if m.version_tag %}<span class="tag">v{{ m.version_tag }}</span>{% endif %}
+    {% for t in m.topics %}<span class="tag">{{ t }}</span>{% endfor %}
+    {% if m.has_spoiler %}<span class="warn-tag">⚠ 含剧透内容</span>{% endif %}
+  </div>
+
+  <div class="card">
+    {% if m.zh_segments %}
+    <div class="zh">{% for seg, sp in m.zh_segments %}{% if sp %}<span class="spoiler">{{ seg }}</span>{% else %}{{ seg }}{% endif %}{% endfor %}</div>
+    {% elif m.text_zh %}
+    <div class="zh">{{ m.text_zh }}</div>
+    {% endif %}
+
+    {% if m.text_raw %}
+    <details>
+      <summary>原文</summary>
+      {% if m.raw_segments %}
+      <pre>{% for seg, sp in m.raw_segments %}{% if sp %}<span class="spoiler">{{ seg }}</span>{% else %}{{ seg }}{% endif %}{% endfor %}</pre>
+      {% else %}
+      <pre>{{ m.text_raw }}</pre>
+      {% endif %}
+    </details>
+    {% endif %}
+
+    {% if m.media %}
+    <div class="media">
+      {% for x in m.media %}
+        {% if x.kind == 'video' and x.video_status == 'ok' and x.video_path %}
+        <div>
+          <video controls preload="metadata" class="{{ 'spoiler' if x.has_spoiler }}"
+                 src="/s/{{ share_token }}/video/{{ x.id }}">
+          </video>
+        </div>
+        {% elif x.thumb %}
+        <div>
+          <img class="{{ 'spoiler' if x.has_spoiler }}" loading="lazy"
+               src="/s/{{ share_token }}/media/{{ x.id }}"
+               alt="{{ '视频封面' if x.kind=='video' else '图片' }}">
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+    <div class="dl-row">
+      {% for x in m.media %}
+        {% if x.kind == 'video' and x.video_status == 'ok' and x.video_path %}
+        <a href="/s/{{ share_token }}/video/{{ x.id }}?dl=1">下载视频 {{ x.video_bytes|filesizeformat }}</a>
+        {% elif x.thumb %}
+        <a href="/s/{{ share_token }}/media/{{ x.id }}?dl=1">下载图片</a>
+        {% endif %}
+      {% endfor %}
+      {% if m.deeplink %}<a href="{{ m.deeplink }}" target="_blank" rel="noreferrer">在 Telegram 打开</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <div class="foot">
+    链接有效期至 {{ expires_at.strftime('%Y-%m-%d %H:%M') }} (UTC) · tgmon
+  </div>
+</div>
+<script>
+function copyShareText(id, button) {
+  var el=document.getElementById(id); if(!el) return;
+  var text=el.value||el.textContent||'';
+  var done=function(){if(button){var old=button.textContent;button.textContent='已复制';setTimeout(function(){button.textContent=old},1400)}};
+  if(navigator.clipboard&&window.isSecureContext) navigator.clipboard.writeText(text).then(done);
+  else {el.hidden=false;el.select();document.execCommand('copy');el.hidden=true;done();}
+}
+</script>
+<script>
+// 剧透点击揭示（与后台同款交互）
+document.addEventListener("click", function (e) {
+  var t = e.target.closest(".spoiler");
+  if (t) t.classList.add("revealed");
+});
+</script>
+</body>
+</html>

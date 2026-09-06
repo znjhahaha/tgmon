@@ -1,0 +1,419 @@
+{% extends "base.html" %}
+{% block title %}知识与记忆中心 · tgmon{% endblock %}
+{% block body %}
+<div class="kb-center">
+<style>
+/* 知识与记忆中心 —— 在 base 设计系统上叠加的专属样式。
+   只做视觉重组：所有表单字段名 / hx 目标 / 路由与旧版完全一致 */
+.kb-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.kb-head h1{margin:0}
+.kb-head .btn{margin:0}
+/* 标签页：分段控件（segmented control） */
+.kb-tabs{display:flex;gap:4px;overflow-x:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;padding:4px;margin:16px 0;
+  white-space:nowrap;scrollbar-width:thin}
+.kb-tabs a{padding:7px 14px;border-radius:7px;color:var(--dim);font-size:13px;
+  text-decoration:none;flex:none;transition:background .12s,color .12s}
+.kb-tabs a:hover{background:var(--panel2);text-decoration:none;color:var(--fg)}
+.kb-tabs a[aria-current=page]{background:var(--acc);color:#fff;font-weight:600}
+/* 区块标题：左侧 accent 竖条，统一 h2 层级 */
+.kb-sec{display:flex;align-items:baseline;gap:9px;margin:0 0 10px;flex-wrap:wrap}
+.kb-sec::before{content:"";display:inline-block;width:3px;height:13px;border-radius:2px;
+  background:var(--acc);align-self:center;flex:none}
+.kb-sec h2{margin:0;font-size:15px}
+.kb-sec .dim{font-size:12px;font-weight:400}
+.kb-sec .spacer{flex:1}
+/* 条目表：类别列不折行（jargon/character 被竖切的元凶） */
+.kb-center td.cat{white-space:nowrap}
+.kb-center td.cat code{white-space:nowrap}
+.kb-center .table-scroll{overflow-x:auto;max-width:100%}
+.kb-center .table-scroll table{min-width:620px}
+.kb-center pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.kb-center input,.kb-center select{max-width:100%;min-width:0}
+.kb-center .evidence{font-size:13px;line-height:1.7}
+.kb-center h2{font-size:15px}
+.kb-center td{overflow-wrap:anywhere}
+/* 绿色主操作：「通过 / 启用」类按钮（base 未定义 .btn.ok，此处补齐） */
+.kb-center .btn.ok{background:var(--ok);color:#05231a}
+/* 表头吸顶：吸在顶栏（sticky）下沿，高度由页尾脚本实测写入 --kb-hdr。
+   桌面端解除 .table-scroll 的横向滚动 —— 有 overflow 的祖先会让
+   sticky 改以该容器为参照，页面滚动时吸顶失效；移动端保留横滚 */
+.kb-center th{position:sticky;top:var(--kb-hdr,49px);z-index:5;background:var(--panel)}
+@media(min-width:721px){.kb-center .table-scroll{overflow:visible}}
+/* 状态徽标统一中文 */
+.tag.done{background:rgba(62,207,142,.16);color:var(--ok)}
+.tag.running{background:rgba(77,159,255,.16);color:var(--acc)}
+.tag.failed{background:rgba(244,99,94,.16);color:var(--err)}
+/* 属性列：k:v 渲染成小徽标，超过 4 个折叠 */
+.attr-tags{display:flex;flex-wrap:wrap;gap:2px;max-width:230px}
+.attr-tags .tag{font-size:10.5px;margin:0}
+/* 筛选表单栅格 */
+.kb-filter{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:10px;align-items:end}
+.kb-filter label{margin:0}
+.kb-filter .btn{align-self:end;height:34px;margin:0}
+@media(max-width:720px){
+  .kb-tabs{gap:2px}
+  .kb-center .grid{grid-template-columns:1fr}
+  .kb-filter{grid-template-columns:1fr 1fr}
+  .kb-head h1{font-size:22px}
+}
+</style>
+
+<div class="kb-head">
+  <div>
+    <h1>知识与记忆中心</h1>
+    <p class="sub" style="margin:4px 0 0">审核术语与译名、管理对话记忆、检索索引与推送诊断</p>
+  </div>
+  <form hx-post="/kb/sync/all" hx-target="#kb-sync-result" style="margin:0">
+    <button class="btn" style="margin:0">同步全部来源</button>
+  </form>
+</div>
+<div id="kb-sync-result"></div>
+
+<nav class="kb-tabs" aria-label="知识中心">
+{% for key, label in center_tabs %}<a href="/kb?tab={{ key }}" {% if key == tab %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}
+</nav>
+
+{% if tab == 'terms' %}
+{# ---- 总览 KPI ---- #}
+<div class="card">
+  <div class="kb-sec"><h2>实体库总览</h2>
+    <span class="dim">参与翻译对照的术语条目</span></div>
+  <div class="grid g4">
+    <div class="kpi"><div class="n">{{ total }}</div><div class="l">总实体条目</div></div>
+    <div class="kpi"><div class="n ok">{{ counts.get("active", 0) }}</div>
+      <div class="l">启用（参与翻译对照）</div></div>
+    <div class="kpi"><div class="n warn">{{ counts.get("pending", 0) }}</div>
+      <div class="l">待审条目</div></div>
+    <div class="kpi"><div class="n dim">{{ counts.get("rejected", 0) + counts.get("disabled", 0) }}</div>
+      <div class="l">拒绝 / 禁用</div></div>
+  </div>
+  {% if counts.get("pending", 0) %}
+  <div class="flash" style="margin:12px 0 0;border-color:var(--warn);display:flex;
+       align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div>
+      <b>发现 {{ counts.get("pending", 0) }} 条待审实体</b>
+      <span class="dim" style="font-size:12px">（主要为属性词或通用词，待审状态不参与翻译）</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <form hx-post="/kb/approve-all" hx-target="#approve-result" style="margin:0"
+            hx-confirm="确认一键通过并启用全部待审条目？">
+        <button class="btn sm ok" style="margin:0">一键全部启用</button>
+      </form>
+      <a href="/kb?status=pending" class="btn sm ghost" style="margin:0">查看待审</a>
+    </div>
+  </div>
+  <div id="approve-result"></div>
+  {% endif %}
+</div>
+
+{# ---- Wiki 译名审核 + 参考资料 ---- #}
+{% include 'fragments/wiki_review.html' %}
+{% include 'fragments/knowledge_documents.html' %}
+
+{# ---- 筛选与批量管理 ---- #}
+<div class="card">
+  <div class="kb-sec"><h2>筛选与批量管理</h2>
+    <span class="dim">批量操作按当前筛选的游戏 + 类别生效</span></div>
+  <form method="get" class="kb-filter">
+    <label>游戏
+      <select name="game">
+        <option value="">全部</option>
+        {% for g in games %}<option value="{{ g }}" {% if g == game %}selected{% endif %}>{{ g }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>类别
+      <select name="category">
+        <option value="">全部</option>
+        {% for c in categories %}<option value="{{ c }}" {% if c == category %}selected{% endif %}>{{ c }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>状态
+      <select name="status">
+        <option value="">全部</option>
+        <option value="pending" {% if status == "pending" %}selected{% endif %}>待审</option>
+        <option value="active" {% if status == "active" %}selected{% endif %}>启用</option>
+        <option value="rejected" {% if status == "rejected" %}selected{% endif %}>拒绝</option>
+        <option value="disabled" {% if status == "disabled" %}selected{% endif %}>禁用</option>
+      </select>
+    </label>
+    <button class="btn">筛选</button>
+  </form>
+
+  <fieldset style="margin-top:14px">
+    <legend>批量改状态</legend>
+    <form hx-post="/kb/bulk-status" hx-target="#bulk-result" class="inline">
+      <input type="hidden" name="game" value="{{ game }}">
+      <input type="hidden" name="category" value="{{ category }}">
+      <label>把
+        <select name="from_status">
+          <option value="pending">待审</option>
+          <option value="active">启用</option>
+          <option value="rejected">拒绝</option>
+          <option value="disabled">禁用</option>
+        </select>
+      </label>
+      <label>改成
+        <select name="to_status">
+          <option value="active">启用</option>
+          <option value="rejected">拒绝</option>
+          <option value="disabled">禁用</option>
+          <option value="pending">待审</option>
+        </select>
+      </label>
+      <button class="btn" hx-confirm="确认批量改状态？会影响筛选范围内的全部条目">批量修改</button>
+    </form>
+    <div id="bulk-result"></div>
+  </fieldset>
+</div>
+
+{# ---- 条目列表 ---- #}
+<div class="card">
+  <div class="kb-sec"><h2>条目列表</h2>
+    <span class="dim">共 {{ matched }} 条{% if pages > 1 %}，第 {{ page }}/{{ pages }} 页{% endif %}</span></div>
+  {% if not rows %}
+  <p class="dim">当前无匹配数据。可到「来源同步」标签页点击游戏的「智能同步」导入数据。</p>
+  {% else %}
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>规范名</th><th>别名</th><th class="cat">类别</th><th>属性</th>
+        <th>游戏</th><th>状态</th><th>命中</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td><b>{{ r.entry.canonical_zh }}</b></td>
+        <td style="max-width:300px;word-break:break-word">
+          {% for a in r.aliases %}
+          <span class="pill" style="font-size:0.85em;margin:2px">
+            {{ a.surface }}
+            {% if a.alias_kind == "community" %}<sup style="color:var(--acc)">社区</sup>{% endif %}
+          </span>
+          {% endfor %}
+        </td>
+        <td class="cat"><code>{{ r.entry.category }}</code></td>
+        <td>
+          {% if r.entry.attrs %}
+          <div class="attr-tags" title="{{ r.entry.attrs | tojson }}">
+            {% for k, v in (r.entry.attrs.items() | list)[:4] %}
+              <span class="tag">{{ k }}:{{ v }}</span>
+            {% endfor %}
+            {% if r.entry.attrs | length > 4 %}<span class="tag dim">+{{ r.entry.attrs | length - 4 }}</span>{% endif %}
+          </div>
+          {% else %}<span class="dim">—</span>{% endif %}
+        </td>
+        <td><span class="tag">{{ r.entry.game }}</span></td>
+        <td>
+          {% set st_label = {'active': '启用', 'pending': '待审', 'rejected': '拒绝', 'disabled': '禁用'}.get(r.entry.status, r.entry.status) %}
+          <span class="tag {{ 'ok' if r.entry.status=='active' else ('warn' if r.entry.status=='pending' else 'err') }}">
+            {{ st_label }}
+          </span>
+        </td>
+        <td class="dim">{{ r.entry.hit_count }}</td>
+        <td>
+          <div style="display:flex;gap:4px;flex-wrap:wrap">
+            {% if r.entry.status != 'active' %}
+            <button class="btn sm ok" style="padding:4px 10px"
+                    hx-post="/kb/entry/{{ r.entry.id }}/status"
+                    hx-vals='{"status": "active"}'
+                    hx-target="closest tr" hx-swap="outerHTML">通过</button>
+            {% endif %}
+            {% if r.entry.status != 'disabled' %}
+            <button class="btn sm ghost" style="padding:4px 10px"
+                    hx-post="/kb/entry/{{ r.entry.id }}/status"
+                    hx-vals='{"status": "disabled"}'
+                    hx-target="closest tr" hx-swap="outerHTML">禁用</button>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% if pages > 1 %}
+  <div class="pager" style="margin-top:14px">
+    {% if page > 1 %}
+    <a href="/kb?page={{ page - 1 }}&game={{ game }}&category={{ category }}&status={{ status }}">上一页</a>
+    {% endif %}
+    <span class="dim">第 {{ page }} / {{ pages }} 页</span>
+    {% if page < pages %}
+    <a href="/kb?page={{ page + 1 }}&game={{ game }}&category={{ category }}&status={{ status }}">下一页</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{% if miss %}
+<div class="card" id="miss">
+  <div class="kb-sec"><h2>术语漏译待复查</h2>
+    <span class="dim">共 {{ miss_total }} 条 · 模型翻译时未保留知识库规范词</span></div>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>消息</th><th>游戏</th><th>漏译术语</th><th>命中术语</th>
+        <th>原文 / 译文片段</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for m in miss %}
+      <tr id="miss-row-{{ m.id }}">
+        <td><a href="/messages#m-{{ m.id }}" target="_blank">#{{ m.id }}</a></td>
+        <td><span class="tag">{{ m.game or "—" }}</span></td>
+        <td>
+          {% for term in m.miss %}
+          <div style="display:flex;align-items:center;gap:4px;margin:2px 0">
+            <span class="tag warn">{{ term }}</span>
+            <form hx-post="/kb/quick-add-pending" hx-target="next .miss-add-result" style="display:inline;margin:0">
+              <input type="hidden" name="surface" value="{{ term }}">
+              <input type="hidden" name="game" value="{{ m.game or '' }}">
+              <button class="btn sm ghost">建待审条目</button>
+            </form><span class="miss-add-result"></span>
+          </div>
+          {% endfor %}
+        </td>
+        <td>
+          {% for hit in m.hits %}
+          <span class="tag ok">{{ hit }}</span>
+          {% endfor %}
+        </td>
+        <td style="max-width:360px;font-size:12px">
+          <div class="dim">{{ m.text_raw|truncate_text(100) }}</div>
+          <div style="margin-top:2px">{{ m.text_zh|truncate_text(100) }}</div>
+        </td>
+        <td>
+          <button class="btn sm ghost"
+                  hx-post="/kb/miss/{{ m.id }}/clear"
+                  hx-target="#miss-row-{{ m.id }}" hx-swap="outerHTML">
+            已审
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
+{% endif %}
+
+{% if tab == 'sources' %}
+<div class="card" style="margin-top:0">
+  <div class="kb-sec"><h2>Wiki 知识来源</h2>
+    <span class="dim">Fandom API 端点，抓取的译名进入「资料与术语」审核</span></div>
+  <form hx-post="/kb/wiki/source" hx-target="#wiki-result" class="inline">
+    <input name="game" placeholder="游戏名，如崩坏:星穹铁道">
+    <input name="url" style="flex:2 1 200px" placeholder="https://.../api.php" required>
+    <input name="categories" placeholder="characters,NPCs,factions">
+    <button class="btn sm ghost">添加来源</button>
+  </form>
+  <div id="wiki-result"></div>
+  {% if wiki_sources %}
+  <div class="table-scroll"><table style="margin-top:8px"><tr><th>游戏</th><th>地址</th><th>状态与信任</th><th>同步</th></tr>
+  {% for source in wiki_sources %}
+  <tr><td>{{ source.game }}</td><td class="dim" style="max-width:320px;overflow-wrap:anywhere">{{ source.url }}</td>
+      <td>
+        <div id="wiki-state-{{ source.id }}">
+        {% if source.last_error %}<span class="tag err">同步失败</span>
+          <div class="dim" style="font-size:11px;max-width:280px">{{ source.last_error }}</div>
+        {% elif source.enabled %}<span class="tag ok">已启用</span>
+        {% else %}<span class="tag">已停用</span>{% endif %}
+        </div>
+        <form hx-post="/kb/source/{{ source.id }}/trust" hx-target="next .res"
+              style="display:flex;align-items:center;gap:6px;margin:6px 0 0">
+          <label style="display:flex;align-items:center;margin:0;font-size:12px">
+            <input type="checkbox" name="trusted" {% if source.trusted %}checked{% endif %}>可信来源
+          </label>
+          <button class="btn sm ghost">保存</button>
+        </form><span class="res"></span>
+      </td>
+      <td><div style="display:flex;gap:4px;flex-wrap:wrap">
+        <button class="btn sm ghost" hx-post="/kb/wiki/source/{{ source.id }}/sync" hx-target="#wiki-result">同步分类</button>
+        <button class="btn sm ghost" hx-post="/kb/wiki/source/{{ source.id }}/toggle" hx-target="#wiki-state-{{ source.id }}">启停</button>
+      </div></td></tr>
+  {% endfor %}</table></div>
+  {% endif %}
+</div>
+
+<div class="kb-sec" style="margin-top:22px"><h2>游戏来源</h2>
+  <span class="dim">每个游戏一条数据链：官方数据 + 社区补充</span></div>
+<div class="grid g3">
+  {% for gc in game_cards %}
+  <div class="card" style="display:flex;flex-direction:column;justify-content:space-between;margin:0">
+    <div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <b style="font-size:16px">{{ gc.name }}</b>
+        <span class="tag ok">{{ gc.active }} 启用</span>
+      </div>
+      <div style="margin:8px 0 12px;font-size:12px;color:var(--dim)">
+        <div>总实体：<b>{{ gc.total }}</b> 个 · 待审：<b class="{{ 'warn' if gc.pending else '' }}">{{ gc.pending }}</b> 个</div>
+        <div style="margin-top:4px">覆盖源：{{ gc.coverage }}</div>
+      </div>
+    </div>
+    <div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn sm" style="flex:1"
+                hx-post="/kb/sync/{{ gc.key }}" hx-target="#sync-box-{{ gc.key }}">
+          智能同步
+        </button>
+        <details style="margin:0">
+          <summary class="btn sm ghost" style="padding:4px 8px">选项 ▾</summary>
+          <div style="position:absolute;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px;box-shadow:0 4px 16px rgba(0,0,0,.4);z-index:15;display:flex;flex-direction:column;gap:4px;min-width:140px;margin-top:4px">
+            {% if gc.key == 'hsr' %}
+            <button class="btn sm ghost" hx-post="/kb/import/hsr?categories=paths,elements" hx-target="#sync-box-{{ gc.key }}">仅命途与属性</button>
+            <button class="btn sm ghost" hx-post="/kb/import/hsr" hx-target="#sync-box-{{ gc.key }}">仅官方TextMap</button>
+            {% else %}
+            <button class="btn sm ghost" hx-post="/kb/import/{{ gc.key }}" hx-target="#sync-box-{{ gc.key }}">仅官方数据</button>
+            {% endif %}
+            <button class="btn sm ghost" hx-post="/kb/import-gachabase/{{ gc.key }}" hx-target="#sync-box-{{ gc.key }}">仅Gachabase补充</button>
+          </div>
+        </details>
+      </div>
+      <div id="sync-box-{{ gc.key }}"></div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card" style="margin-top:14px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div>
+      <div class="kb-sec"><h2>数据版本监控</h2>
+        <span class="dim">gachabase changelog</span></div>
+      <p class="hint" style="margin:0">
+        监控原神、崩铁、绝区零最新 beta/公测数据数值改动。worker 每 20 分钟自动轮询，新 revision 直接作为消息落库推送。
+      </p>
+    </div>
+    <form hx-post="/kb/changelog-poll" hx-target="#changelog-result" class="row" style="margin:0;gap:6px">
+      <select name="game" style="width:auto;margin:0;padding:4px 8px;font-size:12px">
+        <option value="">全部游戏</option>
+        <option value="genshin">原神</option>
+        <option value="hsr">崩铁</option>
+        <option value="zzz">绝区零</option>
+      </select>
+      <button class="btn sm ghost" style="margin:0">立刻检测更新</button>
+    </form>
+  </div>
+  <div id="changelog-result"></div>
+</div>
+{% endif %}
+{% include 'fragments/knowledge_panels.html' %}
+<script>
+// 表头吸顶：顶栏高度随视口折行变化，实测写入 --kb-hdr 供 th 的 top 使用
+(function () {
+  var h = document.querySelector('header');
+  function set() {
+    document.documentElement.style.setProperty('--kb-hdr', h.offsetHeight + 'px');
+  }
+  if (h) { set(); addEventListener('resize', set); }
+})();
+</script>
+</div>
+{% endblock %}

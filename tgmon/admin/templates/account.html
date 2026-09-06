@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}账号与凭据 · tgmon{% endblock %}
+{% block body %}
+<h1>账号与凭据</h1>
+<p class="sub">敏感字段只写不读：已存的值显示为点，留空表示不改。</p>
+
+<div class="card">
+  <h2 style="margin-top:0">TG API 凭据</h2>
+  <p class="hint">
+    去 <a href="https://my.telegram.org" target="_blank" rel="noreferrer">my.telegram.org</a>
+    → API development tools 拿 <code>api_id</code> 与 <code>api_hash</code>。
+    Platform 选 Other。一个账号只能创建一次，之后再进就是显示原值。
+  </p>
+
+  {% if public_id_owner %}
+  <div class="flash err">
+    <b>当前用的是 {{ public_id_owner }} 的公共 api_id</b>，不是你自己注册的。<br>
+    风险不在它会失效，而在：① <b>指纹对不上</b> —— 这个 id 声称自己是官方客户端，
+    但发出去的是 Telethon 的行为特征，服务端能看出来；
+    ② <b>信誉按 api_id 池化</b> —— 它被全世界的爬虫群发工具共用，
+    你继承的是别人攒了几年的黑历史。<br>
+    「新号 + 公共 api_id + 立刻加一堆频道」是最典型的封号组合。自己注册免费、两分钟。
+  </div>
+  {% endif %}
+  <form hx-post="/account/credentials" hx-target="#cred-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>API_ID（纯数字）
+        <input name="api_id" value="{{ api_id }}" inputmode="numeric"></label>
+      <label>API_HASH（32 位十六进制）
+        <input name="api_hash" type="password" placeholder="{{ api_hash_mask or '未设置' }}"
+               autocomplete="new-password"></label>
+    </div>
+    <div class="inline">
+      <label>手机号（带国际区号）
+        <input name="phone_number" type="password" placeholder="{{ phone_mask or '+8613800138000' }}"
+               autocomplete="off"></label>
+      <label>Bot Token（可选，只用于错误告警）
+        <input name="bot_token" type="password" placeholder="{{ bot_token_mask or '未设置' }}"
+               autocomplete="new-password"></label>
+    </div>
+    <label>告警接收者 user_id（可选）
+      <input name="alert_chat_id" value="{{ alert_chat_id }}"></label>
+    <button class="btn">保存</button>
+  </form>
+  <div id="cred-result"></div>
+
+  <details style="margin-top:10px">
+    <summary>哪些字段改完需要重新登录</summary>
+    <table style="margin-top:6px">
+      <tr><th>字段</th><th>影响</th></tr>
+      <tr><td><code>API_ID</code> / <code>API_HASH</code></td>
+          <td>等于换应用，<b>session 失效需重新登录</b></td></tr>
+      <tr><td><code>PHONE_NUMBER</code></td><td>换账号，需重新登录</td></tr>
+      <tr><td>其余全部</td><td>热生效，不用重启</td></tr>
+    </table>
+  </details>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">登录</h2>
+  <p class="hint">
+    验证码<b>发到你的 Telegram 客户端，不是短信</b>。
+    整个流程在网页里完成，不用进容器跑交互式命令。
+    session 文件落在服务器的 <code>./sessions/</code>，由 worker 独占。
+  </p>
+  <div id="login-flow" hx-get="/account/fragment/login-flow" hx-trigger="load">
+    <span class="dim">读取状态…</span>
+  </div>
+  {% if session_exists %}
+  <p class="hint">检测到已有 session 文件。备份它 —— 丢了要重新验证码登录。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">后台密码</h2>
+  <form hx-post="/account/password" hx-target="#pwd-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>原密码<input name="old_password" type="password" required
+             autocomplete="current-password"></label>
+      <label>新密码（至少 8 位）<input name="new_password" type="password" required
+             minlength="8" autocomplete="new-password"></label>
+    </div>
+    <button class="btn">改密码</button>
+  </form>
+  <div id="pwd-result"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">访客账号</h2>
+  <p class="hint">
+    访客（guest）登录后只能看<a href="/messages">消息浏览</a>与 RSS 清单、
+    可播放归档视频；全部管理页 403、全部操作按钮隐藏，全站限流
+    30 次/分钟。访客自己也能在登录后改密码（页面底部的改密表单通用）。
+  </p>
+  <form hx-post="/account/guest/create" hx-target="#guest-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>用户名（3-60 字符）<input name="username" required></label>
+      <label>初始密码（至少 8 位，创建后交给对方）<input name="password"
+             type="password" required minlength="8"></label>
+    </div>
+    <button class="btn">创建访客</button>
+  </form>
+  <div id="guest-result"></div>
+
+  {% if accounts %}
+  <table style="margin-top:10px">
+    <tr><th>用户名</th><th>角色</th><th>创建于</th><th>最后登录</th><th></th></tr>
+    {% for a in accounts %}
+    <tr>
+      <td><b>{{ a.username }}</b></td>
+      <td><span class="tag {{ 'ok' if a.role == 'admin' }}">{{ a.role }}</span></td>
+      <td class="dim">{{ a.created_at|fmt_local('%Y-%m-%d') }}</td>
+      <td class="dim">{{ a.last_login_at|ago if a.last_login_at else '从未' }}</td>
+      <td>
+        {% if a.role == 'guest' %}
+        <button class="btn sm danger"
+                hx-post="/account/guest/{{ a.id }}/delete"
+                hx-confirm="删除访客 {{ a.username }}？"
+                hx-target="#guest-del-{{ a.id }}" hx-swap="innerHTML">删</button>
+        <span id="guest-del-{{ a.id }}"></span>
+        {% else %}
+        <span class="dim">—</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="hint">删除账号后，对方浏览器里已签发的会话最长还能活 7 天 ——
+    改一次任何密码可使其失效。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="flash">
+    <b>账号风险</b>：用用户账号自动化读取违反 TG 的 ToS，加入大量爆料频道更容易触发风控。
+    强烈建议用<b>专门的小号</b>，别用主账号。加频道的节奏也别太猛。
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Prompt · tgmon{% endblock %}
+{% block body %}
+<h1>Prompt 模板</h1>
+<p class="sub">
+  三层，优先级由低到高：<b>全局</b> → <b>按游戏</b> → <b>按频道</b>。高层覆盖低层。
+  术语对照表在运行时自动追加到 prompt 末尾，不用手写。
+</p>
+
+<div class="card">
+  <h2 style="margin-top:0">① 全局默认</h2>
+  <p class="hint">最后更新：{{ global_updated|fmt_local }}</p>
+  <form hx-post="/prompts/global" hx-target="#g-result" hx-swap="innerHTML">
+    <textarea name="body" style="min-height:280px" required>{{ global_body }}</textarea>
+    <button class="btn">保存</button>
+  </form>
+  <div id="g-result"></div>
+  <details>
+    <summary>看内置默认模板（想恢复就复制回去）</summary>
+    <pre>{{ default_body }}</pre>
+  </details>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">② 按游戏</h2>
+  <form hx-post="/prompts/game" hx-target="#gm-result" hx-swap="innerHTML">
+    <label>游戏分组名（要和频道上填的一致）
+      <input name="scope_key" list="pg-games" required></label>
+    <datalist id="pg-games">{% for g in known_games %}<option value="{{ g }}">{% endfor %}</datalist>
+    <label>prompt<textarea name="body" required>{{ global_body }}</textarea></label>
+    <button class="btn">保存这个游戏的 prompt</button>
+  </form>
+  <div id="gm-result"></div>
+
+  {% for g in games %}
+  <details style="margin-top:10px">
+    <summary><b>{{ g.scope_key }}</b> · 更新于 {{ g.updated_at|fmt_local }}</summary>
+    <form hx-post="/prompts/game" hx-target="next .res" hx-swap="innerHTML">
+      <input type="hidden" name="scope_key" value="{{ g.scope_key }}">
+      <textarea name="body" required>{{ g.body }}</textarea>
+      <button class="btn sm">保存</button>
+    </form>
+    <div class="res"></div>
+    <form method="post" action="/prompts/game/{{ g.id }}/delete"
+          onsubmit="return confirm('删掉这个游戏层 prompt？该游戏会回落到全局层。')">
+      <button class="btn sm danger">删除</button>
+    </form>
+  </details>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">③ 按频道</h2>
+  <p class="hint">频道级覆盖在<a href="/channels">频道管理</a>里每个频道的「配置」里改。这里只列出已设置的。</p>
+  {% if overrides %}
+  <table>
+    <tr><th>频道</th><th>prompt 开头</th><th></th></tr>
+    {% for o in overrides %}
+    <tr><td><b>{{ o.title }}</b></td>
+        <td class="dim">{{ o.body|truncate_text(140) }}</td>
+        <td><a class="btn sm ghost" href="/channels?q={{ o.title }}">去改</a></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="dim">没有频道设了覆盖，全部走游戏层 / 全局层。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">试译预览</h2>
+  <p class="hint">拿真实历史消息跑一次，<b>结果只显示不入库、不推送</b>。会真实消耗一次 AI 调用。</p>
+  {% if samples %}
+  <form hx-post="/prompts/trial" hx-target="#trial-result" hx-swap="innerHTML"
+        hx-indicator="#trial-spin">
+    <label>选一条历史消息
+      <select name="message_id">
+        {% for s in samples %}
+        <option value="{{ s.id }}">#{{ s.id }} · {{ s.text }}</option>
+        {% endfor %}
+      </select></label>
+    <label>游戏分组（决定用哪套术语，留空则跟随该消息所属频道）
+      <input name="game" list="pg-games"></label>
+    <label>要测试的 prompt
+      <textarea name="body" style="min-height:200px" required>{{ global_body }}</textarea></label>
+    <button class="btn">试译</button>
+    <span id="trial-spin" class="htmx-indicator">调用中，几秒到几十秒…</span>
+  </form>
+  <div id="trial-result"></div>
+  {% else %}
+  <p class="dim">还没有任何入库消息可用于试译。先去<a href="/channels">频道管理</a>勾选频道并「补最近 20 条历史」。</p>
+  {% endif %}
+</div>
+{% endblock %}

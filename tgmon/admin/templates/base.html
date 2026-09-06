@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}tgmon{% endblock %}</title>
+<link rel="icon" href="data:,">
+<style>
+/* CSS 内联而不外链：从大陆访问 RTT 233ms，省一个往返比省缓存更值 */
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e2229;--line:#2a2f3a;
+--fg:#e6e8ec;--dim:#9aa3b2;--acc:#4d9fff;--ok:#3ecf8e;--warn:#f0b429;--err:#f4635e}
+@media(prefers-color-scheme:light){:root{--bg:#f6f7f9;--panel:#fff;
+--panel2:#f0f2f5;--line:#dfe3e8;--fg:#1a1d23;--dim:#666e7d;--acc:#0b62d0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,
+-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+code{background:var(--panel2);padding:1px 5px;border-radius:4px;
+font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+pre{background:var(--panel2);padding:10px;border-radius:6px;overflow-x:auto;
+white-space:pre-wrap;word-break:break-word;margin:6px 0;font-size:13px}
+header{background:var(--panel);border-bottom:1px solid var(--line);
+padding:10px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+position:sticky;top:0;z-index:20}
+.brand{font-weight:700;letter-spacing:.5px}
+nav{display:flex;gap:2px;flex-wrap:wrap;flex:1;align-items:center}
+nav a{padding:5px 10px;border-radius:6px;color:var(--dim);font-size:13px}
+nav a:hover{background:var(--panel2);text-decoration:none}
+nav a.on{background:var(--acc);color:#fff}
+/* 两级导航：低频页收进「配置」下拉 */
+.nav-more{position:relative}
+.nav-more>summary{padding:5px 10px;border-radius:6px;color:var(--dim);
+font-size:13px;cursor:pointer;list-style:none;user-select:none}
+.nav-more>summary::-webkit-details-marker{display:none}
+.nav-more>summary:hover{background:var(--panel2)}
+.nav-more>summary.on{background:var(--acc);color:#fff}
+.nav-menu{position:absolute;top:calc(100% + 4px);left:0;min-width:150px;
+background:var(--panel);border:1px solid var(--line);border-radius:8px;
+padding:4px;box-shadow:0 6px 20px rgba(0,0,0,.35);z-index:30;
+display:flex;flex-direction:column}
+.nav-menu a{white-space:nowrap}
+.wstat{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--err);flex:none}
+.dot.up{background:var(--ok)}
+main{max-width:1180px;margin:0 auto;padding:18px 16px 60px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:22px 0 8px}
+h3{font-size:14px;margin:14px 0 6px}
+.sub{color:var(--dim);font-size:13px;margin:0 0 16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+padding:14px 16px;margin-bottom:14px}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+.kpi{background:var(--panel2);border-radius:8px;padding:12px}
+.kpi .n{font-size:22px;font-weight:600;line-height:1.2}
+.kpi .l{color:var(--dim);font-size:12px}
+label{display:block;margin:8px 0;font-size:13px;color:var(--dim)}
+input,select,textarea{width:100%;background:var(--bg);color:var(--fg);
+border:1px solid var(--line);border-radius:6px;padding:7px 9px;font:inherit;
+font-size:13px;margin-top:3px}
+input[type=checkbox]{width:auto;margin:0 6px 0 0;vertical-align:middle}
+textarea{min-height:90px;font-family:ui-monospace,Menlo,Consolas,monospace;
+font-size:12.5px;resize:vertical}
+.inline{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.inline label{flex:1;min-width:130px}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;
+padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}
+.btn:hover{filter:brightness(1.12)}
+.btn.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
+.btn.danger{background:var(--err)}
+.btn.sm{padding:3px 9px;font-size:12px;margin:0}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);
+vertical-align:top}
+th{color:var(--dim);font-weight:500;font-size:12px;white-space:nowrap}
+tr:hover td{background:var(--panel2)}
+.pill{border:0;border-radius:99px;padding:2px 10px;font-size:12px;
+cursor:pointer;background:var(--panel2);color:var(--dim)}
+.pill.on{background:var(--ok);color:#05231a}
+.pill.off{background:var(--panel2);color:var(--dim)}
+.tag{display:inline-block;background:var(--panel2);color:var(--dim);
+border-radius:4px;padding:1px 6px;font-size:11px;margin:1px 3px 1px 0}
+.tag.ok{background:rgba(62,207,142,.16);color:var(--ok)}
+.tag.warn{background:rgba(240,180,41,.16);color:var(--warn)}
+.tag.err{background:rgba(244,99,94,.16);color:var(--err)}
+.flash{background:var(--panel2);border-left:3px solid var(--acc);
+padding:8px 12px;border-radius:0 6px 6px 0;margin:8px 0;font-size:13px}
+.flash.ok{border-color:var(--ok)}.flash.err{border-color:var(--err)}
+.hint{color:var(--dim);font-size:12px;margin:6px 0}
+.ok{color:var(--ok)}.err{color:var(--err)}.warn{color:var(--warn)}
+.dim{color:var(--dim)}
+details{margin:6px 0}summary{cursor:pointer;color:var(--acc);font-size:13px}
+.thumb{max-width:200px;max-height:140px;border-radius:6px;border:1px solid var(--line)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.spacer{flex:1}
+.htmx-indicator{opacity:0;color:var(--dim)}
+.htmx-request .htmx-indicator,.htmx-request.htmx-indicator{opacity:1}
+.msg{border-bottom:1px solid var(--line);padding:12px 0}
+.msg:last-child{border:0}
+.msg .head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+font-size:12px;color:var(--dim);margin-bottom:6px}
+.msg .zh{white-space:pre-wrap;word-break:break-word}
+.pager{display:flex;gap:6px;align-items:center;margin-top:14px;font-size:13px}
+.pager a{padding:4px 10px;background:var(--panel2);border-radius:6px}
+.trial pre{max-height:340px;overflow:auto}
+.key{display:block;padding:8px;margin-top:6px;font-size:12px}
+fieldset{border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+margin:10px 0}
+legend{color:var(--dim);font-size:12px;padding:0 6px}
+.chk{display:flex;gap:12px;flex-wrap:wrap}
+.chk label{display:flex;align-items:center;margin:4px 0;color:var(--fg);flex:none}
+.scroll{max-height:220px;overflow-y:auto;border:1px solid var(--line);
+border-radius:6px;padding:8px}
+/* 剧透：默认模糊，点击揭示。文本 5px、图片 12px（缩略图信息密度低，
+   5px 遮不住轮廓） */
+.spoiler{filter:blur(5px);cursor:pointer;transition:filter .15s;border-radius:3px}
+img.spoiler,video.spoiler{filter:blur(12px)}
+.spoiler.revealed{filter:none;cursor:auto}
+
+/* ---------- 移动端（≤720px）：纯 CSS 适配，不改结构 ---------- */
+@media (max-width:720px){
+main{padding:12px 10px 40px}
+h1{font-size:18px}
+header{padding:8px 10px;gap:8px}
+/* 导航：主项只有 6 个，直接折行（旧版 10 项才需要横滑）。
+   折行保证「配置」下拉的绝对定位菜单不被 overflow 裁剪 */
+nav{order:3;flex-basis:100%;flex-wrap:wrap;gap:2px}
+nav a,.nav-more>summary{white-space:nowrap}
+.wstat{font-size:11px;margin-left:auto}
+/* 表单堆叠：手机上并排的筛选项挤成一条 */
+.inline{flex-direction:column;align-items:stretch;gap:6px}
+.inline label{flex:none;min-width:0}
+.chk{gap:8px}
+/* 表格横向滚动（卡片作滚动容器，不动表格布局） */
+.card{overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* KPI 单列/双列 */
+.grid,.g2,.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+/* 触控目标 ≥40px：按钮、输入、分页 */
+.btn{min-height:40px;padding:9px 16px}
+.btn.sm{min-height:34px}
+input,select,textarea{padding:9px 10px;font-size:15px}   /* 15px 防 iOS 聚焦缩放 */
+.pager a{padding:8px 14px}
+/* 缩略图与配置面板别超出小屏 */
+.thumb{max-width:46%;max-height:120px}
+details form[style]{min-width:0 !important;width:100%}
+.msg .head{font-size:11px;gap:6px}
+/* 消息行操作按钮加大点击区 */
+.msg .row .btn.sm{min-height:36px;margin:2px 4px 2px 0}
+.kpi .n{font-size:19px}
+}
+</style>
+<script src="/static/htmx.min.js" defer></script>
+<script>
+// 剧透点击揭示：事件委托，一处监听覆盖全部消息行与详情片段
+document.addEventListener("click", function (e) {
+  var t = e.target.closest(".spoiler");
+  if (t) t.classList.add("revealed");
+});
+// 两级导航下拉：点击页面其它地方关闭（原生 details 不会自动收起）
+document.addEventListener("click", function (e) {
+  var d = document.getElementById("nav-more");
+  if (d && d.open && !e.target.closest("#nav-more")) d.open = false;
+});
+// lightbox：点 .thumb-m（带 data-* 的媒体缩略图）站内预览。
+// data-img=大图路径 data-video=归档mp4路径 data-tg=TG深链 data-spoil=剧透
+document.addEventListener("click", function (e) {
+  var t = e.target.closest(".thumb-m");
+  if (!t) return;
+  e.preventDefault();
+  var lb = document.getElementById("lightbox");
+  if (!lb) return;
+  var img = t.getAttribute("data-img") || "";
+  var vid = t.getAttribute("data-video") || "";
+  var tg  = t.getAttribute("data-tg") || "";
+  var spoil = t.getAttribute("data-spoil") === "1";
+  var h = '<div class="lb-body">';
+  if (vid) {
+    h += '<video controls autoplay playsinline class="' +
+         (spoil ? 'spoiler' : '') + '" src="' + vid + '"></video>';
+  } else if (img) {
+    h += '<img class="' + (spoil ? 'spoiler' : '') + '" src="' + img +
+         '" alt="预览" loading="lazy">';
+  }
+  h += '<div class="lb-bar">';
+  if (vid) h += '<a href="' + vid + '?dl=1" download>下载视频</a>';
+  if (img) h += '<a href="' + img + '" download>下载图片</a>';
+  if (tg) h += '<a href="' + tg + '" target="_blank" rel="noreferrer">在 TG 打开</a>';
+  h += '<span>' + (spoil ? '剧透内容：点击图片揭开模糊' : '') + '</span></div></div>';
+  lb.querySelector(".lb-wrap").innerHTML = h;
+  lb.classList.add("open");
+  document.body.style.overflow = "hidden";
+});
+// 关闭 lightbox：点背景 / Esc。暂停视频防止后台继续出声
+document.addEventListener("click", function (e) {
+  var lb = document.getElementById("lightbox");
+  if (lb && lb.classList.contains("open") &&
+      (e.target === lb || e.target.closest(".lb-close"))) {
+    var v = lb.querySelector("video");
+    if (v) v.pause();
+    lb.classList.remove("open");
+    document.body.style.overflow = "";
+  }
+});
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  var lb = document.getElementById("lightbox");
+  if (lb && lb.classList.contains("open")) {
+    var v = lb.querySelector("video");
+    if (v) v.pause();
+    lb.classList.remove("open");
+    document.body.style.overflow = "";
+  }
+});
+// htmx 全局错误提示：非 2xx 默认静默不渲染 —— 用户看到的就是「点了没反应」。
+// 这里统一弹顶部错误条（8 秒消失），503 给出 worker 掉线的人话解释
+document.addEventListener("htmx:responseError", function (e) {
+  var s = e.detail.xhr.status;
+  var msg = s === 503
+    ? "worker 容器不在线，这个操作需要它执行。看 docker compose logs worker"
+    : (s === 401 ? "登录已过期，正在刷新…" : "请求失败（HTTP " + s + "），稍后再试");
+  var bar = document.getElementById("global-err");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "global-err";
+    document.body.prepend(bar);
+  }
+  bar.textContent = msg;
+  bar.className = "show";
+  clearTimeout(bar._t);
+  bar._t = setTimeout(function () { bar.className = ""; }, 8000);
+  if (s === 401) setTimeout(function () { location.reload(); }, 1200);
+});
+</script>
+<style>
+#global-err{position:fixed;top:0;left:0;right:0;z-index:99;background:var(--err);
+color:#fff;padding:10px 16px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.4);
+opacity:0;pointer-events:none;transition:opacity .2s}
+#global-err.show{opacity:1}
+/* ---------- 进度条与实时任务体系 ---------- */
+.progress-track{width:100%;background:var(--panel2);border:1px solid var(--line);
+border-radius:99px;height:10px;overflow:hidden;position:relative;margin:8px 0}
+.progress-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),#3ecf8e);
+transition:width .35s ease;background-size:24px 24px}
+.progress-fill.active{background-image:linear-gradient(
+45deg,rgba(255,255,255,.15) 25%,transparent 25%,transparent 50%,
+rgba(255,255,255,.15) 50%,rgba(255,255,255,.15) 75%,transparent 75%,transparent);
+animation:progress-stripes 1.2s linear infinite}
+@keyframes progress-stripes{0%{background-position:0 0}100%{background-position:24px 0}}
+.progress-fill.indeterminate{width:40%!important;position:absolute;animation:progress-indet 1.5s ease-in-out infinite}
+@keyframes progress-indet{0%{left:-40%}100%{left:100%}}
+
+.task-pill{display:inline-flex;align-items:center;gap:6px;background:rgba(77,159,255,.12);
+border:1px solid rgba(77,159,255,.32);padding:3px 10px;border-radius:99px;
+font-size:12px;color:var(--fg);text-decoration:none;transition:all .2s;white-space:nowrap}
+.task-pill:hover{background:rgba(77,159,255,.22);text-decoration:none}
+.pulse-dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex:none;
+animation:pulse-ring 1.8s infinite}
+@keyframes pulse-ring{0%{box-shadow:0 0 0 0 rgba(77,159,255,.7)}
+70%{box-shadow:0 0 0 6px rgba(77,159,255,0)}100%{box-shadow:0 0 0 0 rgba(77,159,255,0)}}
+.task-pill-txt{max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.task-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+padding:12px 14px;margin:10px 0}
+.task-card .task-head{display:flex;align-items:center;gap:8px;font-size:13px}
+.task-card .task-title{font-weight:600;display:flex;align-items:center;gap:6px}
+.task-card .task-foot{display:flex;justify-content:space-between;align-items:center;
+font-size:12px;color:var(--dim);margin-top:4px}
+.task-card .task-foot b{color:var(--fg)}
+.spinner{width:12px;height:12px;border:2px solid rgba(255,255,255,.2);
+border-top-color:var(--acc);border-radius:50%;animation:spin .7s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- lightbox：图片/视频站内预览与下载 ---------- */
+#lightbox{position:fixed;inset:0;z-index:90;background:rgba(8,10,14,.92);
+display:none;align-items:center;justify-content:center;padding:20px}
+#lightbox.open{display:flex}
+#lightbox .lb-body{max-width:min(94vw,1100px);max-height:82vh;display:flex;
+flex-direction:column;align-items:center;gap:10px}
+#lightbox img,#lightbox video{max-width:94vw;max-height:70vh;border-radius:6px;
+background:#000}
+#lightbox .lb-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+justify-content:center;font-size:13px;color:var(--dim)}
+#lightbox .lb-bar a{color:var(--acc)}
+#lightbox .lb-close{position:absolute;top:12px;right:16px;font-size:26px;
+color:#fff;cursor:pointer;line-height:1;background:none;border:0}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">tgmon</span>
+  <nav>
+    {% if role != 'guest' %}
+    <a href="/" class="{{ 'on' if nav_active=='overview' }}">概览</a>
+    <a href="/channels" class="{{ 'on' if nav_active=='channels' }}">频道</a>
+    <a href="/kb" class="{{ 'on' if nav_active=='kb' }}">知识与记忆</a>
+    {% endif %}
+    <a href="/messages" class="{{ 'on' if nav_active=='messages' }}">消息</a>
+    {% if role != 'guest' %}
+    <a href="/system" class="{{ 'on' if nav_active=='system' }}">系统</a>
+    {# 低频配置页收进下拉。details/summary：桌面移动统一点击展开 #}
+    <details class="nav-more" id="nav-more">
+      <summary class="{{ 'on' if nav_active in ('account','providers','prompts','dedupe','outputs','qqbot','shares') }}">配置 ▾</summary>
+      <div class="nav-menu">
+        <a href="/account" class="{{ 'on' if nav_active=='account' }}">账号与凭据</a>
+        <a href="/providers" class="{{ 'on' if nav_active=='providers' }}">Provider</a>
+        <a href="/prompts" class="{{ 'on' if nav_active=='prompts' }}">Prompt</a>
+        <a href="/dedupe" class="{{ 'on' if nav_active=='dedupe' }}">去重</a>
+        <a href="/outputs" class="{{ 'on' if nav_active=='outputs' }}">输出</a>
+        <a href="/qqbot" class="{{ 'on' if nav_active=='qqbot' }}">QQ 机器人</a>
+        <a href="/shares" class="{{ 'on' if nav_active=='shares' }}">分享链接</a>
+      </div>
+    </details>
+    {% endif %}
+  </nav>
+  <span class="wstat">
+    {% if role == 'guest' %}<span class="tag">访客</span>{% endif %}
+    <span class="dot {{ 'up' if worker and worker.online }}"></span>
+    {% if worker and worker.online %}worker {{ worker.status }}{% else %}worker 掉线{% endif %}
+  </span>
+  {% if role != 'guest' and worker and worker.current_action %}
+  <a href="/#tasks" class="task-pill" title="点击跳转任务监控">
+    <span class="pulse-dot"></span>
+    <span class="task-pill-txt">{{ worker.current_action }}</span>
+  </a>
+  {% endif %}
+  {% if user %}
+  <form method="post" action="/logout" style="margin:0">
+    <button class="btn sm ghost">退出</button>
+  </form>
+  {% endif %}
+</header>
+<main>{% block body %}{% endblock %}</main>
+<div id="lightbox"><button class="lb-close" aria-label="关闭">×</button>
+  <div class="lb-wrap"></div></div>
+<script>
+function copyShareText(id, button) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const text = el.value || el.textContent || '';
+  const done = () => { if (button) { const old = button.textContent; button.textContent = '已复制'; setTimeout(() => button.textContent = old, 1400); } };
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done);
+  else { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand('copy'); s.removeAllRanges(); done(); }
+}
+</script>
+</body>
+</html>

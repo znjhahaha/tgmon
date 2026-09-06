@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% block title %}输出配置 · tgmon{% endblock %}
+{% block body %}
+<h1>输出配置</h1>
+<p class="sub">RSS feed、JSON API Key、Webhook。<a href="/feeds">看所有订阅地址</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">全局</h2>
+  <form hx-post="/outputs/config" hx-target="#oc-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>对外地址（RSS 绝对链接与缩略图 URL 用）
+        <input name="base_url" value="{{ base_url }}" placeholder="https://znj2006.cn"></label>
+      <label>API 默认限速（次/分）
+        <input name="api_rate" value="{{ api_rate }}" inputmode="numeric"></label>
+      <label style="flex:none;display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="webhook_enabled" {{ 'checked' if webhook_enabled }}>
+        启用 webhook 推送</label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="oc-result"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">RSS feed</h2>
+  <form hx-post="/outputs/feeds/create" hx-target="#f-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>slug（URL 用，小写字母数字-_）<input name="slug" required
+             placeholder="genshin-leaks"></label>
+      <label>标题<input name="title" required></label>
+      <label>最大条目<input name="max_items" value="50" inputmode="numeric"></label>
+    </div>
+    <label>描述<input name="description"></label>
+    <div class="inline">
+      <label>游戏分组（逗号分隔，留空=不限）<input name="games"
+             placeholder="{{ games|join(', ') }}"></label>
+      <label>关键词（逗号分隔，任一命中）<input name="keywords"></label>
+    </div>
+    <fieldset>
+      <legend>频道（都不勾=全部）</legend>
+      <div class="chk scroll">
+        {% for c in channels %}
+        <label><input type="checkbox" name="channel_ids" value="{{ c.id }}">{{ c.title }}</label>
+        {% endfor %}
+      </div>
+    </fieldset>
+    <div class="chk">
+      <label><input type="checkbox" name="include_duplicates">包含判重的消息</label>
+      <label><input type="checkbox" name="include_original" checked>译文后附原文</label>
+      <label><input type="checkbox" name="public" checked>公开（不勾则需 API Key）</label>
+    </div>
+    <button class="btn">建 feed</button>
+  </form>
+  <div id="f-result"></div>
+
+  {% if feeds %}
+  <table style="margin-top:12px">
+    <tr><th>slug</th><th>标题</th><th>范围</th><th>条目</th><th>公开</th><th></th></tr>
+    {% for f in feeds %}
+    <tr>
+      <td><code>{{ f.slug }}</code></td>
+      <td>{{ f.title }}</td>
+      <td class="dim" style="font-size:12px">
+        {% if f.channel_ids %}{{ f.channel_ids|length }} 个频道{% else %}全部频道{% endif %}
+        {% if f.games %}· 游戏 {{ f.games|join('/') }}{% endif %}
+        {% if f.keywords %}· 关键词 {{ f.keywords|join('/') }}{% endif %}
+        {% if f.include_duplicates %}· 含重复{% endif %}
+      </td>
+      <td>{{ f.max_items }}</td>
+      <td>{{ '是' if f.public else '需 Key' }}</td>
+      <td class="row">
+        <a class="btn sm ghost" href="/rss/{{ f.slug }}" target="_blank">打开</a>
+        <a class="btn sm ghost" href="/rss/{{ f.slug }}?media=none" target="_blank">纯文本</a>
+        <form method="post" action="/outputs/feeds/{{ f.id }}/delete"
+              onsubmit="return confirm('删除这个 feed？')">
+          <button class="btn sm danger">删</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="hint">
+    订阅地址：<code>{{ base_url or '你的地址' }}/rss/&lt;slug&gt;</code>。
+    加 <code>?media=none</code> 出纯文本版 —— 大陆访问 61 KB/s 时能省掉图片请求。
+  </p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">API Key</h2>
+  <form hx-post="/outputs/keys/create" hx-target="#k-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>名字（标明给谁用）<input name="name" required placeholder="我的QQ机器人"></label>
+      <label>限速（次/分）<input name="rate_per_min" value="120" inputmode="numeric"></label>
+    </div>
+    <button class="btn">生成</button>
+  </form>
+  <div id="k-result"></div>
+
+  {% if keys %}
+  <table style="margin-top:12px">
+    <tr><th>名字</th><th>前缀</th><th>状态</th><th>限速</th><th>调用</th><th>最后使用</th><th></th></tr>
+    {% for k in keys %}
+    <tr>
+      <td>{{ k.name }}</td>
+      <td><code>{{ k.prefix }}…</code></td>
+      <td><button class="pill {{ 'on' if k.enabled else 'off' }}"
+                  hx-post="/outputs/keys/{{ k.id }}/toggle" hx-swap="outerHTML">
+        {{ '启用中' if k.enabled else '已吊销' }}</button></td>
+      <td>{{ k.rate_per_min }}/min</td>
+      <td>{{ k.use_count }}</td>
+      <td class="dim">{{ k.last_used_at|ago }}</td>
+      <td><form method="post" action="/outputs/keys/{{ k.id }}/delete"
+                onsubmit="return confirm('永久删除这个 Key？')">
+        <button class="btn sm danger">删</button></form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <details>
+    <summary>API 用法</summary>
+    <pre>GET  /api/messages?limit=50&amp;channel_id=1&amp;since=2026-09-01T00:00:00
+GET  /api/messages/&lt;id&gt;
+GET  /api/channels
+GET  /api/stats
+POST /api/webhook/test?webhook_id=1
+
+请求头：X-API-Key: 你的key
+参数：include_duplicates=true 才会返回判重的消息</pre>
+  </details>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Webhook</h2>
+  <form hx-post="/outputs/hooks/create" hx-target="#h-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>名字<input name="name" required></label>
+      <label>URL<input name="url" required placeholder="https://your-bot/hook"></label>
+    </div>
+    <div class="inline">
+      <label>HMAC 密钥（可选，用于验签）
+        <input name="secret" type="password" autocomplete="new-password"></label>
+      <label>最大重试次数<input name="max_retry" value="4" inputmode="numeric"></label>
+      <label style="flex:none;display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="include_duplicates">推送判重消息</label>
+    </div>
+    <fieldset>
+      <legend>频道（都不勾=全部）</legend>
+      <div class="chk scroll">
+        {% for c in channels %}
+        <label><input type="checkbox" name="channel_ids" value="{{ c.id }}">{{ c.title }}</label>
+        {% endfor %}
+      </div>
+    </fieldset>
+    <button class="btn">添加</button>
+  </form>
+  <div id="h-result"></div>
+
+  {% for h in hooks %}
+  <details style="margin-top:10px">
+    <summary>
+      <b>{{ h.name }}</b> {{ h.url }}
+      {% if h.enabled %}<span class="tag ok">启用</span>{% else %}<span class="tag">停用</span>{% endif %}
+      {% if h.pending %}<span class="tag warn">{{ h.pending }} 待重试</span>{% endif %}
+      {% if h.failed %}<span class="tag err">{{ h.failed }} 已放弃</span>{% endif %}
+    </summary>
+    <form hx-post="/outputs/hooks/{{ h.id }}/update" hx-target="next .res"
+          hx-swap="innerHTML">
+      <div class="inline">
+        <label>名字<input name="name" value="{{ h.name }}" required></label>
+        <label>URL<input name="url" value="{{ h.url }}" required></label>
+      </div>
+      <div class="inline">
+        <label>HMAC 密钥（留空不改）
+          <input name="secret" type="password" placeholder="{{ h.secret_mask or '未设置' }}"
+                 autocomplete="new-password"></label>
+        <label>最大重试<input name="max_retry" value="{{ h.max_retry }}" inputmode="numeric"></label>
+      </div>
+      <fieldset>
+        <legend>频道（都不勾=全部）</legend>
+        <div class="chk scroll">
+          {% for c in channels %}
+          <label><input type="checkbox" name="channel_ids" value="{{ c.id }}"
+                 {{ 'checked' if c.id in h.channel_ids }}>{{ c.title }}</label>
+          {% endfor %}
+        </div>
+      </fieldset>
+      <div class="chk">
+        <label><input type="checkbox" name="enabled" {{ 'checked' if h.enabled }}>启用</label>
+        <label><input type="checkbox" name="include_duplicates"
+               {{ 'checked' if h.include_duplicates }}>推送判重消息</label>
+      </div>
+      <button class="btn sm">保存</button>
+    </form>
+    <div class="res"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn sm ghost" hx-post="/outputs/hooks/{{ h.id }}/test"
+              hx-target="#ht-{{ h.id }}" hx-swap="innerHTML">发测试推送</button>
+      <span id="ht-{{ h.id }}" style="font-size:12px"></span>
+      <form method="post" action="/outputs/hooks/{{ h.id }}/delete"
+            onsubmit="return confirm('删除这个 webhook？')">
+        <button class="btn sm danger">删除</button></form>
+    </div>
+  </details>
+  {% endfor %}
+  <details>
+    <summary>验签方式</summary>
+    <pre>请求头 X-Tgmon-Signature: sha256=&lt;hex&gt;
+hex = HMAC-SHA256(secret, 原始请求体字节)
+请求体 = {"event":"message","data":{...}}</pre>
+  </details>
+</div>
+{% endblock %}

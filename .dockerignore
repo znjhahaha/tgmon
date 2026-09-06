@@ -1,0 +1,16 @@
+.git
+.env
+secret.key
+db
+sessions
+media
+logs
+caddy
+models
+.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+.pytest-tmp
+_*
+*.log

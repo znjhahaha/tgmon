@@ -1,0 +1,58 @@
+<table>
+  <tr>
+    <th>状态</th><th>频道</th><th>游戏</th>
+    <th>消息</th><th>对齐</th><th>最后活跃</th><th></th>
+  </tr>
+  {% for c in channels %}
+  <tr>
+    <td>
+      <button class="pill {{ 'on' if c.enabled else 'off' }}"
+              hx-post="/channels/{{ c.id }}/toggle" hx-swap="outerHTML">
+        {{ '监控中' if c.enabled else '已暂停' }}</button>
+    </td>
+    <td>
+      <b>{{ c.title }}</b><br>
+      <span class="dim" style="font-size:12px">
+        {% if c.source_type != 'telegram' %}网站源{% elif c.username %}@{{ c.username }}{% else %}私密{% endif %}
+        · <code>{{ c.tg_id }}</code></span>
+    </td>
+    <td>
+      {% if c.game %}<span class="tag">{{ c.game }}</span>
+      {% elif c.games %}{% for g in c.games[:3] %}<span class="tag">{{ g }}</span>{% endfor %}
+      {% else %}<span class="dim">—</span>{% endif %}
+    </td>
+    <td>{{ c.message_count }}</td>
+    <td>
+      {% if c.source_type != 'telegram' %}
+        <span class="dim">—</span>
+      {% elif c.catchup_gap is none %}
+        <span class="dim" title="{{ '上次对账 ' ~ (c.last_catchup_at|fmt_local if c.last_catchup_at else '从未') }}">待对齐</span>
+      {% elif c.catchup_gap <= 0 %}
+        <span class="tag ok" title="TG 最新 #{{ c.last_tg_id }} = 已入库 #{{ c.db_max_tg }}">同步</span>
+      {% elif c.catchup_gap <= catchup_max_gap %}
+        <span class="tag warn" title="TG 最新 #{{ c.last_tg_id }}，已入库 #{{ c.db_max_tg }}">落后 {{ c.catchup_gap }}</span>
+      {% else %}
+        <span class="tag warn" title="TG 最新 #{{ c.last_tg_id }}，已入库 #{{ c.db_max_tg }}">落后 {{ c.catchup_gap }}（下轮对齐只补窗口内）</span>
+      {% endif %}
+    </td>
+    <td class="dim">{{ c.last_message_at|ago }}</td>
+    <td>
+      <div class="row" style="gap:6px;flex-wrap:nowrap">
+        <a class="btn sm ghost" href="/channels/{{ c.id }}">配置</a>
+        {% if c.enabled and c.source_type == 'telegram' %}
+        <button class="btn sm ghost" hx-post="/channels/{{ c.id }}/align"
+                hx-target="#align-row-{{ c.id }}" hx-swap="innerHTML">对齐</button>
+        {% endif %}
+      </div>
+      <div id="align-row-{{ c.id }}" style="font-size:12px"></div>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="dim">
+    还没有频道。先在 TG 客户端里加入想监控的频道，然后点上面的「从我的账号同步」。
+  </td></tr>
+  {% endfor %}
+</table>
+<datalist id="games-list">
+  {% for g in games %}<option value="{{ g }}">{% endfor %}
+</datalist>

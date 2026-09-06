@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}频道配置 · {{ c.title }} · tgmon{% endblock %}
+{% block body %}
+<h1>{{ c.title }}</h1>
+<p class="sub">
+  {% if c.source_type != 'telegram' %}网站源{% elif c.username %}@{{ c.username }}{% else %}私密频道{% endif %}
+  · <code>{{ c.tg_id }}</code>
+  · {{ c.message_count }} 条消息
+  · 最后活跃 {{ c.last_message_at|ago if c.last_message_at else '未知' }}
+  <a href="/channels" style="margin-left:8px">← 返回列表</a>
+</p>
+
+<div class="card">
+  <div class="row">
+    <form hx-post="/channels/{{ c.id }}/toggle" hx-swap="none" style="margin:0">
+      <button class="btn {{ 'ghost' if c.enabled else '' }}">
+        {{ '暂停监控' if c.enabled else '开始监控' }}</button>
+    </form>
+    {% if c.source_type == 'telegram' %}
+    <form hx-post="/channels/{{ c.id }}/align" hx-target="#align-result"
+          hx-swap="innerHTML" style="margin:0">
+      <button class="btn ghost">立即对齐最近{{ align_days }}天</button>
+    </form>
+    {% endif %}
+    <form method="post" action="/channels/{{ c.id }}/delete"
+          onsubmit="return confirm('从列表删除这个频道？已入库的消息不会删。')"
+          style="margin:0">
+      <button class="btn danger">删除频道</button>
+    </form>
+  </div>
+  <div id="align-result"></div>
+  <p class="hint">对齐 = 比对 TG 侧最新消息与库里的，只补「最近 N 天」窗口内的缺口
+    （N 在系统页设置）。勾选即生效的监听开关worker 15 秒内感知，不用重启。</p>
+</div>
+
+<form method="post" action="/channels/{{ c.id }}/save">
+  <div class="card">
+    <h2 style="margin-top:0">基础</h2>
+    <div class="inline">
+      <label>默认游戏（兜底值，留空则不限）
+        <input name="game" value="{{ c.game }}" list="games-list"></label>
+      <label>候选游戏（逗号分隔，留空=全库检测）
+        <input name="games" value="{{ ','.join(c.games) if c.games else '' }}"
+               placeholder="原神,崩坏:星穹铁道,绝区零"></label>
+    </div>
+    <p class="hint">候选游戏白名单：只在这些游戏间按实体投票检测归属。
+      适用于混发多款游戏但不是全部游戏的频道（如只发米哈游三款）。</p>
+    <div class="chk">
+      <label><input type="checkbox" name="translate" {{ 'checked' if c.translate }}>翻译该频道</label>
+      <label><input type="checkbox" name="force_push" {{ 'checked' if c.force_push }}>判重也强推</label>
+    </div>
+    <p class="hint">「判重也强推」用于你关注的主频道 —— 即使情报别的频道先发过也照样推。</p>
+    <button class="btn">保存</button>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">媒体</h2>
+    <div class="chk">
+      <label><input type="checkbox" name="allow_photo" {{ 'checked' if c.allow_photo }}>保存图片</label>
+      <label><input type="checkbox" name="allow_video" {{ 'checked' if c.allow_video }}>保存视频缩略图</label>
+      <label><input type="checkbox" name="allow_document" {{ 'checked' if c.allow_document }}>保存文档</label>
+      <label><input type="checkbox" name="keep_video" {{ 'checked' if c.keep_video }}>归档视频（下载转码存私有目录）</label>
+    </div>
+    <div class="inline">
+      <label>媒体大小上限 MB（0=不限）
+        <input name="max_media_mb" value="{{ c.max_media_mb }}" inputmode="numeric"></label>
+      <label>归档视频源上限 MB（0=用全局默认）
+        <input name="video_max_mb" value="{{ c.video_max_mb }}" inputmode="numeric"></label>
+    </div>
+    <p class="hint">归档视频受系统页「视频归档」总开关和大小/时长上限约束，
+      双闸门都开才会真的下载转码。</p>
+    <button class="btn">保存</button>
+  </div>
+
+  <details class="card">
+    <summary><b>高级：双语策略与 prompt 覆盖</b>（一般不用动）</summary>
+    <label style="margin-top:10px">中文原文处理
+      <select name="bilingual_policy">
+        <option value="zh_first" {{ 'selected' if c.bilingual_policy == 'zh_first' }}>
+          中文优先 —— 有中文段就只留中文，丢掉外文段（默认）</option>
+        <option value="per_block" {{ 'selected' if c.bilingual_policy == 'per_block' }}>
+          逐段 —— 中文段照抄，只翻外文段</option>
+        <option value="always" {{ 'selected' if c.bilingual_policy == 'always' }}>
+          总是翻译 —— 整条送模型，等于关掉语言路由</option>
+      </select></label>
+    <p class="hint">爆料频道多数原文本来就是中文（源头是贴吧/NGA）。
+      中文优先能省调用，也避免把圈内人的话改写成谁都不说的说法。</p>
+    <label>prompt 覆盖（留空则用游戏层 / 全局层）
+      <textarea name="prompt_override"
+                placeholder="留空继承上层">{{ c.prompt_override }}</textarea></label>
+    <button class="btn">保存</button>
+  </details>
+</form>
+
+{% if c.source_type == 'telegram' %}
+<div class="card">
+  <h2 style="margin-top:0">拉取历史</h2>
+  <form hx-post="/channels/{{ c.id }}/backfill" hx-target="#bf-result"
+        hx-swap="innerHTML" class="inline">
+    <label>补<input name="limit" value="" placeholder="{{ backfill_default }}"
+                   inputmode="numeric" style="width:70px"> 条</label>
+    <label>不早于<input name="min_date" type="date" style="width:150px"></label>
+    <button class="btn ghost">执行</button>
+  </form>
+  <div id="bf-result"></div>
+  <details>
+    <summary>更早的缺口？（从某条之前开始）</summary>
+    <form hx-post="/channels/{{ c.id }}/backfill" hx-target="#bf-result"
+          hx-swap="innerHTML" class="inline" style="margin-top:8px">
+      <label>补<input name="limit" value="" placeholder="{{ backfill_default }}"
+                     inputmode="numeric" style="width:70px"> 条</label>
+      <label>从 msg#<input name="offset_id" value="" placeholder="留空=最新"
+                           inputmode="numeric" style="width:90px"> 之前</label>
+      <label>不早于<input name="min_date" type="date" style="width:150px"></label>
+      <button class="btn ghost">执行</button>
+    </form>
+  </details>
+  <p class="hint">N 条约产生 N 次 AI 调用，预算闸门照常生效。
+    日常断线缺口用上面的「立即对齐」就够了，这里只在补更早历史时用。</p>
+</div>
+{% endif %}
+
+<datalist id="games-list">
+  {% for g in games %}<option value="{{ g }}">{% endfor %}
+</datalist>
+{% endblock %}

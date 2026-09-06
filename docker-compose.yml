@@ -1,0 +1,59 @@
+x-common: &common
+  build: .
+  image: tgmon:local
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    TZ: Asia/Shanghai
+    TGMON_DB: /app/db/tgmon.db
+    TGMON_SESSIONS: /app/sessions
+    TGMON_MEDIA: /app/media
+  volumes:
+    - ./db:/app/db
+    - ./sessions:/app/sessions
+    - ./media:/app/media
+    - ./logs:/app/logs
+    # 代码也挂进去（只读）。镜像里已有一份，挂载是为了改完代码
+    # `docker compose restart` 就生效，不必 rebuild。只有改 requirements 才需要重建
+    - ./tgmon:/app/tgmon:ro
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # Web 后台：唯一配置入口。永不连接 Telethon（会话独占权归 worker）
+  admin:
+    <<: *common
+    container_name: tgmon-admin
+    command: ["python", "-m", "tgmon.admin"]
+    expose:
+      - "8000"
+
+  # 抓取 + 翻译 + 出站。独占 user session，并消费 admin 下发的任务队列
+  worker:
+    <<: *common
+    container_name: tgmon-worker
+    command: ["python", "-m", "tgmon.worker"]
+
+  caddy:
+    image: caddy:2.9-alpine
+    container_name: tgmon-caddy
+    restart: unless-stopped
+    # daemon.json 默认把发布端口绑到 127.0.0.1，这里必须显式写 0.0.0.0
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+      - ./media:/srv/media:ro
+    depends_on:
+      - admin
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

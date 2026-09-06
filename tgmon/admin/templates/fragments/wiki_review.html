@@ -1,0 +1,73 @@
+<section id="wiki-review" style="margin:20px 0;padding:12px 0;border-block:1px solid var(--line);scroll-margin-top:120px">
+  <style>
+    @media(max-width:720px){
+      #wiki-filter,#wiki-batch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+      #wiki-filter label,#wiki-batch label{margin:4px 0;min-width:0}
+      #wiki-filter .btn,#wiki-batch .btn{margin:4px 0;min-width:0;padding:9px 8px}
+      #wiki-review .pager{flex-wrap:wrap}
+    }
+  </style>
+  {% set labels = {'pending':'待审核','active':'已通过','rejected':'已拒绝','disabled':'已停用'} %}
+  {% set categories = {'character':'角色','npc':'NPC','faction':'派系','lore':'设定','other':'其他'} %}
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">Wiki 译名审核</h2>
+    <span class="dim">待审 {{ wiki_counts.get('pending', 0) }} · 已通过 {{ wiki_counts.get('active', 0) }} · 已拒绝 {{ wiki_counts.get('rejected', 0) }}</span>
+  </div>
+  <form id="wiki-filter" class="inline" hx-get="/kb/wiki/review" hx-target="#wiki-review" hx-swap="outerHTML">
+    <label>游戏<select name="wiki_game"><option value="">全部游戏</option>
+      {% for game in wiki_games %}<option value="{{ game }}" {{ 'selected' if game == wiki_game }}>{{ game }}</option>{% endfor %}
+    </select></label>
+    <label>类别<select name="wiki_category"><option value="">全部类别</option>
+      {% for cat in wiki_categories %}<option value="{{ cat }}" {{ 'selected' if cat == wiki_category }}>{{ categories.get(cat, cat) }}</option>{% endfor %}
+    </select></label>
+    <label>状态<select name="wiki_status">
+      {% for status, label in labels.items() %}<option value="{{ status }}" {{ 'selected' if status == wiki_status }}>{{ label }}</option>{% endfor %}
+    </select></label>
+    <button class="btn" type="submit">筛选</button>
+  </form>
+  {% if wiki_notice %}<div role="status" class="flash {{ 'err' if wiki_error else 'ok' }}">{{ wiki_notice }}</div>{% endif %}
+  {% if wiki_rows %}
+  <form id="wiki-batch" class="inline" hx-post="/kb/wiki/bulk-status" hx-target="#wiki-review" hx-swap="outerHTML"
+        hx-include="#wiki-filter, #wiki-review [name='page_ids']:checked" style="margin:8px 0 12px">
+    <input type="hidden" name="wiki_page" value="{{ wiki_page }}">
+    <label>范围<select name="scope"><option value="selected">已勾选页面</option><option value="filtered">当前筛选全部 {{ wiki_total }} 页</option></select></label>
+    <label>操作<select name="status"><option value="active">通过</option><option value="rejected">拒绝</option><option value="pending">退回待审</option></select></label>
+    <button class="btn" type="submit">批量处理</button>
+    {% if wiki_status == 'pending' %}<button class="btn ghost" type="button" hx-post="/kb/wiki/bulk-status"
+        hx-include="#wiki-filter" hx-vals='{"scope":"filtered","status":"rejected","invalid_only":"1"}'
+        hx-target="#wiki-review" hx-swap="outerHTML">拒绝无效译名</button>{% endif %}
+  </form>
+  <div class="table-scroll">
+    <table style="min-width:720px;table-layout:fixed">
+      <thead><tr>
+        <th style="width:36px"><input type="checkbox" aria-label="全选本页" title="全选本页"
+          onchange="this.closest('table').querySelectorAll('[name=page_ids]').forEach(c=>c.checked=this.checked)"></th>
+        <th style="width:100px">游戏</th><th>来源页面 / 别名</th><th style="width:27%">规范中文名</th>
+        <th style="width:66px">类别</th><th style="width:120px">操作</th>
+      </tr></thead>
+      <tbody>{% for row in wiki_rows %}{% set p = row.page %}
+      <tr>
+        <td><input type="checkbox" name="page_ids" value="{{ p.id }}" aria-label="选择 {{ p.title }}"
+          onchange="const all=this.closest('table').querySelector('[aria-label=全选本页]');const items=[...this.closest('table').querySelectorAll('[name=page_ids]')];all.checked=items.every(c=>c.checked);all.indeterminate=items.some(c=>c.checked)&&!all.checked"></td>
+        <td style="overflow-wrap:anywhere">{{ row.source.game }}</td>
+        <td style="overflow-wrap:anywhere"><b>{{ p.title }}</b><div class="dim" style="font-size:11px">{{ row.source.url }}</div>
+          <div class="dim">{{ row.aliases|join(' / ') }}</div></td>
+        <td><form id="wiki-item-{{ p.id }}" hx-post="/kb/wiki/page/{{ p.id }}/status" hx-include="#wiki-filter"
+                  hx-target="#wiki-review" hx-swap="outerHTML">
+          <input name="canonical_zh" value="{{ p.entity or '' }}" maxlength="200" aria-label="{{ p.title }} 的规范中文名" placeholder="中文译名" style="min-width:0;width:100%;margin:0">
+          <input type="hidden" name="wiki_page" value="{{ wiki_page }}">
+        </form>{% if row.reason %}<span class="dim" style="font-size:12px">{{ row.reason }}</span>{% endif %}</td>
+        <td>{{ categories.get(p.category, p.category) }}</td>
+        <td><div style="display:flex;flex-wrap:wrap;gap:4px">
+          <button class="btn sm ok" form="wiki-item-{{ p.id }}" type="submit" name="status" value="active">通过</button>
+          <button class="btn sm ghost" form="wiki-item-{{ p.id }}" type="submit" name="status" value="{{ 'pending' if wiki_status == 'rejected' else 'rejected' }}">{{ '退回' if wiki_status == 'rejected' else '拒绝' }}</button>
+        </div></td>
+      </tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% else %}<p class="dim">没有{{ labels.get(wiki_status, '待审核') }}的 Wiki 页面。</p>{% endif %}
+  <div class="pager"><span>共 {{ wiki_total }} 项 · 第 {{ wiki_page }} / {{ wiki_pages }} 页</span>
+    {% if wiki_page > 1 %}<button class="btn sm ghost" hx-get="/kb/wiki/review" hx-include="#wiki-filter" hx-vals='{"wiki_page":{{ wiki_page - 1 }}}' hx-target="#wiki-review" hx-swap="outerHTML">上一页</button>{% endif %}
+    {% if wiki_page < wiki_pages %}<button class="btn sm ghost" hx-get="/kb/wiki/review" hx-include="#wiki-filter" hx-vals='{"wiki_page":{{ wiki_page + 1 }}}' hx-target="#wiki-review" hx-swap="outerHTML">下一页</button>{% endif %}
+  </div>
+</section>

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}概览 · tgmon{% endblock %}
+{% block body %}
+<h1>概览</h1>
+<p class="sub">每 10 秒自动刷新。</p>
+
+<div class="card" hx-get="/fragment/overview-stats" hx-trigger="every 10s"
+     hx-swap="innerHTML">
+  {% include "fragments/overview_stats.html" %}
+</div>
+
+{% if worker.status == 'need_credentials' %}
+<div class="card">
+  <div class="flash">还没填 TG 凭据。去<a href="/account">账号与凭据</a>填
+    <code>API_ID</code> / <code>API_HASH</code> / 手机号，然后在网页里完成登录。</div>
+</div>
+{% elif worker.status == 'need_login' %}
+<div class="card">
+  <div class="flash">凭据已就绪但还没登录。去<a href="/account">账号与凭据</a>点「发送验证码」。</div>
+</div>
+{% elif worker.online and s.channels_on == 0 %}
+<div class="card">
+  <div class="flash">已登录但还没勾选要监控的频道。去<a href="/channels">频道管理</a>点同步。</div>
+</div>
+{% endif %}
+
+<h2>最近错误与告警</h2>
+<div class="card">
+  {% if s.recent_events %}
+  <table>
+    <tr><th>时间</th><th>级别</th><th>来源</th><th>内容</th></tr>
+    {% for e in s.recent_events %}
+    <tr>
+      <td class="dim">{{ e.created_at|fmt_local }}</td>
+      <td><span class="tag {{ 'err' if e.level=='error' else 'warn' }}">{{ e.level }}</span></td>
+      <td class="dim">{{ e.source }}</td>
+      <td>{{ e.message|truncate_text(220) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="dim">没有错误。</p>
+  {% endif %}
+</div>
+{% endblock %}

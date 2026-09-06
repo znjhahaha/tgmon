@@ -1,0 +1,74 @@
+{
+	admin off
+	# 没带 SNI 的连接（例如直接用 IP 访问）用哪本证书。
+	# 不设这个的话 `tls internal` 不知道该给谁签，握手直接 internal error。
+	default_sni 69.33.211.94
+}
+
+# ---------------------------------------------------------------
+# 主入口：tg.hidisiwa.xyz。Caddy 自动申请 Let's Encrypt 真证书（HTTP-01），
+# 并自动附带 HTTP→HTTPS 跳转与 ACME 挑战路由，不用手写 :80 块。
+#
+# 前提：A 记录指向 69.33.211.94，且 CF 代理先关（灰云）。
+# 之后想翻橙云：源站此时已有真证书，CF 的 SSL/TLS 模式可以直接选最严的
+# Full (strict)，不用中途降级。
+# ---------------------------------------------------------------
+tg.hidisiwa.xyz {
+	encode zstd gzip
+
+	# 有真证书了才敢开 HSTS。不加 includeSubDomains ——
+	# 同域下 www 是你的 Pages 站，别牵连它
+	header Strict-Transport-Security "max-age=15552000"
+	header X-Content-Type-Options "nosniff"
+	header X-Frame-Options "DENY"
+	header Referrer-Policy "same-origin"
+	header -Server
+
+	# 归档视频在 media/private/ 下 —— 整个 media 目录只读挂给了 Caddy，
+	# 不拦住等于把 TG 视频对公网再分发。这里转发给 admin 走登录鉴权
+	# （admin 里该路由先于 /media 静态挂载注册），而不是静态直发。
+	# handle 组互斥且按顺序匹配，必须放在 handle_path 之前
+	handle /media/private/* {
+		reverse_proxy admin:8000
+	}
+
+	# 缩略图直接由 Caddy 发，不唤醒 Python。长缓存省大陆访客流量，
+	# 翻橙云后 CF 边缘还会再缓存一层
+	handle_path /media/* {
+		root * /srv/media
+		header Cache-Control "public, max-age=2592000, immutable"
+		file_server
+	}
+
+	reverse_proxy admin:8000
+}
+
+# ---------------------------------------------------------------
+# IP 访问：保留自签，作为域名没生效或 DNS 出问题时的后备通道。
+# 浏览器会警告 —— 正常，公共 CA 不签裸 IP。
+# ---------------------------------------------------------------
+https://69.33.211.94, https://localhost {
+	tls internal
+
+	encode zstd gzip
+
+	# 归档视频不静态直发，转发给 admin 鉴权（同上，见域名块注释）
+	handle /media/private/* {
+		reverse_proxy admin:8000
+	}
+
+	handle_path /media/* {
+		root * /srv/media
+		header Cache-Control "public, max-age=2592000, immutable"
+		file_server
+	}
+
+	reverse_proxy admin:8000
+}
+
+# IP 的 HTTP 请求跳 HTTPS。
+# 注意：不要写裸 `:80` 全局块 —— 那会抢掉 Caddy 给 tg.hidisiwa.xyz 自动装的
+# ACME 挑战路由，导致证书永远申请不下来。域名的跳转 Caddy 已自动处理。
+http://69.33.211.94 {
+	redir https://{host}{uri} permanent
+}

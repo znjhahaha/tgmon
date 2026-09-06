@@ -1,0 +1,87 @@
+<div class="grid g4">
+  <div class="kpi"><div class="n">{{ s.today }}</div><div class="l">24 小时消息</div></div>
+  <div class="kpi"><div class="n">{{ s.dups }}</div><div class="l">其中判重</div></div>
+  <div class="kpi"><div class="n">{{ s.ai_calls }}</div><div class="l">今日 AI 调用</div></div>
+  <div class="kpi"><div class="n">{{ '%.2f'|format(s.ai_cost) }}</div><div class="l">今日花费估算</div></div>
+  <div class="kpi"><div class="n">{{ worker.queue_depth }}</div><div class="l">队列深度</div></div>
+  <div class="kpi"><div class="n">{{ s.channels_on }}/{{ s.channels_all }}</div><div class="l">监控中频道</div></div>
+  <div class="kpi"><div class="n">{{ s.thumb_bytes|human_bytes }}</div><div class="l">缩略图占用（{{ s.media_files }} 个）</div></div>
+  <div class="kpi"><div class="n">{{ s.total }}</div><div class="l">累计入库</div></div>
+</div>
+
+<div class="row" style="margin-top:12px">
+  <span class="dot {{ 'up' if worker.online }}"></span>
+  <b>{% if worker.online %}worker 在线{% else %}worker 掉线{% endif %}</b>
+  <span class="tag">{{ worker.status }}</span>
+  {% if worker.tg_user %}<span class="tag ok">{{ worker.tg_user }}</span>{% endif %}
+  {% if worker.current_action %}
+    <span class="tag warn">进行中：{{ worker.current_action }}</span>
+  {% else %}
+    <span class="tag">空闲</span>
+  {% endif %}
+  <span class="dim">{{ worker.detail or '' }}</span>
+  <span class="spacer"></span>
+  <span class="dim">心跳 {{ worker.heartbeat_at|ago }}</span>
+</div>
+
+<div id="tasks" style="margin-top:14px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+    <b style="font-size:14px">实时任务与拉取控制台</b>
+    {% if s.active_tasks %}
+      <span class="tag ok">运行中 ({{ s.active_tasks|length }})</span>
+    {% else %}
+      <span class="tag">待命中</span>
+    {% endif %}
+    <span class="spacer"></span>
+    <form hx-post="/system/catchup-now" hx-target="#overview-task-action" hx-swap="innerHTML" style="margin:0">
+      <button class="btn sm ghost">立即全量对齐一轮</button>
+    </form>
+  </div>
+  <div id="overview-task-action"></div>
+
+  {% if s.active_tasks %}
+    {% for t in s.active_tasks %}
+    <div class="task-card" style="background:var(--panel);border-color:var(--acc);margin:8px 0">
+      <div class="task-head">
+        <div class="task-title">
+          <span class="spinner"></span>
+          <span>#{{ t.id }} {{ t.title }}</span>
+        </div>
+        <span class="spacer"></span>
+        <span class="tag {{ 'ok' if t.status == 'running' else 'warn' }}">
+          {{ '执行中' if t.status == 'running' else '排队中' }}
+        </span>
+      </div>
+      <div class="progress-track" style="height:12px;margin:10px 0">
+        <div class="progress-fill {{ 'indeterminate' if t.percent is none else 'active' }}"
+             style="width: {{ t.percent if t.percent is not none else 100 }}%"></div>
+      </div>
+      <div class="task-foot">
+        <span>{{ t.detail }}</span>
+        {% if t.percent is not none %}
+        <b style="font-family:ui-monospace,monospace;font-size:14px">{{ t.percent }}%</b>
+        {% endif %}
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:4px">下发于 {{ t.created_at|ago }}</div>
+    </div>
+    {% endfor %}
+  {% elif s.latest_task %}
+    <div class="card" style="margin:6px 0;padding:10px 14px;background:var(--panel2);display:flex;align-items:center;gap:10px">
+      <span class="dot {{ 'up' if s.latest_task.is_success else '' }}"></span>
+      <span class="dim" style="font-size:12px">上次任务：</span>
+      <b style="font-size:13px">{{ s.latest_task.title }}</b>
+      <span class="dim" style="font-size:12px">{{ s.latest_task.detail }}</span>
+      <span class="spacer"></span>
+      <span class="dim" style="font-size:11px">{{ s.latest_task.created_at|ago }}</span>
+    </div>
+  {% else %}
+    <div class="dim" style="font-size:12px;padding:8px 0">系统待命中，暂无活动任务。</div>
+  {% endif %}
+</div>
+
+{% if s.failed or s.glossary_miss %}
+<div class="row" style="margin-top:8px">
+  {% if s.failed %}<span class="tag err">{{ s.failed }} 条翻译失败</span>{% endif %}
+  {% if s.glossary_miss %}<a class="tag warn" href="/kb#miss">{{ s.glossary_miss }} 条术语漏译待复查</a>{% endif %}
+</div>
+{% endif %}

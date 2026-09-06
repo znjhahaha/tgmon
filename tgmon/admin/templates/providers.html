@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Provider · tgmon{% endblock %}
+{% block body %}
+<h1>Provider 管理</h1>
+<p class="sub">
+  按协议而非厂商建模，加新后端只是在这儿填一行。<code>base_url</code> 必填、无默认值。
+</p>
+
+<div class="card">
+  <div class="flash">
+    这台机器上 <code>api.openai.com</code> 与 <code>api.anthropic.com</code>
+    是<b>硬 403</b>（地区封锁，不是网络问题）。所以这里填的必须是能从香港访问的
+    <b>中转地址</b>，或 Gemini 的 OpenAI 兼容端点。填完点「测试」验证。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">加一个后端</h2>
+  <form hx-post="/providers/create" hx-target="#create-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>名字（自己起）<input name="name" placeholder="我的中转-gemini" required></label>
+      <label>协议<select name="protocol">
+        {% for p in protocols %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      </select></label>
+      <label>优先级（小的先试）<input name="priority" value="100" inputmode="numeric"></label>
+    </div>
+    <div class="inline">
+      <label>base_url（完整地址）
+        <input name="base_url" placeholder="https://你的中转/v1" required></label>
+      <label>模型 ID<input name="model" placeholder="gemini-2.0-flash" required></label>
+    </div>
+    <div class="inline">
+      <label>API Key<input name="api_key" type="password" autocomplete="new-password"></label>
+      <label>max_tokens<input name="max_tokens" value="4096" inputmode="numeric"></label>
+      <label>temperature<input name="temperature" value="0.3"></label>
+      <label>超时（秒）<input name="timeout" value="90" inputmode="numeric"></label>
+    </div>
+    <div class="inline">
+      <label>并发上限<input name="concurrency" value="2" inputmode="numeric"></label>
+      <label>每分钟请求上限（0=不限）<input name="rpm_limit" value="0" inputmode="numeric"></label>
+      <label>输入单价 元/百万token<input name="price_in" value="0"></label>
+      <label>输出单价 元/百万token<input name="price_out" value="0"></label>
+    </div>
+    <label>额外请求头（JSON，可留空）
+      <input name="extra_headers" placeholder='{"X-Foo":"bar"}'></label>
+    <button class="btn">添加</button>
+  </form>
+  <div id="create-result"></div>
+</div>
+
+<h2>已配置（按优先级升序尝试，失败自动降级到下一个）</h2>
+{% for p in providers %}
+<div class="card">
+  <div class="row">
+    <b>{{ p.name }}</b>
+    <span class="tag">{{ p.protocol }}</span>
+    <span class="tag">{{ p.model }}</span>
+    <span class="tag">优先级 {{ p.priority }}</span>
+    {% if p.enabled %}<span class="tag ok">启用</span>
+    {% else %}<span class="tag">停用</span>{% endif %}
+    <span class="spacer"></span>
+    <span class="dim" style="font-size:12px">
+      成功 {{ p.ok_count }} · 失败 {{ p.fail_count }}
+      {% if p.ok_count or p.fail_count %}（失败率 {{ '%.1f'|format(p.fail_rate) }}%）{% endif %}
+      · 最近成功 {{ p.last_ok_at|ago }}</span>
+  </div>
+
+  {% if p.last_error %}
+  <div class="flash err" style="font-size:12px">最近错误：{{ p.last_error|truncate_text(300) }}</div>
+  {% endif %}
+
+  <div class="row" style="margin:8px 0">
+    <form hx-post="/providers/{{ p.id }}/test" hx-target="#test-{{ p.id }}"
+          hx-swap="innerHTML" hx-indicator="#spin-{{ p.id }}" style="margin:0">
+      <button class="btn sm">连通性测试</button>
+      <span id="spin-{{ p.id }}" class="htmx-indicator">发一句测试文本…</span>
+    </form>
+  </div>
+  <div id="test-{{ p.id }}"></div>
+
+  <details>
+    <summary>编辑</summary>
+    <form hx-post="/providers/{{ p.id }}/update" hx-target="#upd-{{ p.id }}"
+          hx-swap="innerHTML">
+      <div class="inline">
+        <label>名字<input name="name" value="{{ p.name }}" required></label>
+        <label>协议<select name="protocol">
+          {% for pr in protocols %}
+          <option value="{{ pr }}" {{ 'selected' if pr==p.protocol }}>{{ pr }}</option>
+          {% endfor %}</select></label>
+        <label>优先级<input name="priority" value="{{ p.priority }}" inputmode="numeric"></label>
+      </div>
+      <div class="inline">
+        <label>base_url<input name="base_url" value="{{ p.base_url }}" required></label>
+        <label>模型<input name="model" value="{{ p.model }}" required></label>
+      </div>
+      <div class="inline">
+        <label>API Key（留空不改）
+          <input name="api_key" type="password" placeholder="{{ p.key_mask or '未设置' }}"
+                 autocomplete="new-password"></label>
+        <label>max_tokens<input name="max_tokens" value="{{ p.max_tokens }}" inputmode="numeric"></label>
+        <label>temperature<input name="temperature" value="{{ p.temperature }}"></label>
+        <label>超时<input name="timeout" value="{{ p.timeout }}" inputmode="numeric"></label>
+      </div>
+      <div class="inline">
+        <label>并发<input name="concurrency" value="{{ p.concurrency }}" inputmode="numeric"></label>
+        <label>RPM 上限<input name="rpm_limit" value="{{ p.rpm_limit }}" inputmode="numeric"></label>
+        <label>输入单价<input name="price_in" value="{{ p.price_in }}"></label>
+        <label>输出单价<input name="price_out" value="{{ p.price_out }}"></label>
+      </div>
+      <label>额外请求头 JSON
+        <input name="extra_headers" value="{{ p.extra_headers }}"></label>
+      <label style="display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="enabled" {{ 'checked' if p.enabled }}>启用</label>
+      <button class="btn sm">保存</button>
+    </form>
+    <div id="upd-{{ p.id }}"></div>
+    <form method="post" action="/providers/{{ p.id }}/delete" style="margin-top:8px"
+          onsubmit="return confirm('删除这个 provider？')">
+      <button class="btn sm danger">删除</button>
+    </form>
+  </details>
+</div>
+{% else %}
+<div class="card"><p class="dim">
+  还没有翻译后端。上面加一个，否则消息只会原文入库并标记未翻译（不会丢）。
+</p></div>
+{% endfor %}
+{% endblock %}

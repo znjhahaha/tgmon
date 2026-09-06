@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}分享链接 · tgmon{% endblock %}
+{% block body %}
+<h1>分享链接</h1>
+<p class="sub">全部已生成的分享链接（最近 200 条）。链接 URL 可随时复制；
+  旧版链接（升级前生成）只存哈希，URL 无法找回但可撤销。
+  合并链接 = 一个链接看多条消息。</p>
+
+<div class="card">
+  {% if items %}
+  <table>
+    <tr><th>#</th><th>状态</th><th>消息</th><th>内容预览</th><th>过期时间</th>
+        <th>访问</th><th>链接</th><th>操作</th></tr>
+    {% for v in items %}
+    <tr>
+      <td>{{ v.id }}</td>
+      <td><span class="tag {{ 'ok' if v.active }}">{{ v.state }}</span></td>
+      <td class="dim">{% if v.n_msgs > 1 %}{{ v.n_msgs }} 条合并{% else %}单条{% endif %}</td>
+      <td class="dim" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="{{ v.preview }}">{{ v.preview }}</td>
+      <td class="dim">{{ v.expires_at.strftime('%m-%d %H:%M') }}</td>
+      <td>{{ v.views }}</td>
+      <td>
+        {% if v.url %}
+        <input class="key" style="width:170px;font-size:11px" readonly
+               value="{{ v.url }}" onclick="this.select()">
+        <button class="btn sm" onclick="navigator.clipboard.writeText('{{ v.url }}')">复制链接</button>
+        <textarea id="copy-share-{{ v.id }}" hidden>{{ v.copy_text or v.preview }}
+
+{{ v.url }}</textarea>
+        <button class="btn sm ghost" onclick="copyShareText('copy-share-{{ v.id }}',this)">复制分享文案</button>
+        {% else %}
+        <span class="dim">旧链接·不可恢复</span>
+        {% endif %}
+      </td>
+      <td style="white-space:nowrap">
+        {% if v.revoked %}
+        <button class="btn sm ghost" hx-post="/shares/{{ v.id }}/restore"
+                hx-swap="none">恢复</button>
+        {% else %}
+        <button class="btn sm ghost" hx-post="/shares/{{ v.id }}/revoke"
+                hx-swap="none" hx-confirm="撤销后访客立即 404，确定？">撤销</button>
+        {% endif %}
+        <form hx-post="/shares/{{ v.id }}/extend" hx-swap="none"
+              style="display:inline-flex;gap:2px;align-items:center">
+          <select name="hours" style="width:auto;padding:2px 4px;font-size:12px">
+            <option value="24h">+24h</option>
+            <option value="7d" selected>+7天</option>
+            <option value="30d">+30天</option>
+          </select>
+          <button class="btn sm ghost">续期</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="dim">还没有分享链接。去<a href="/messages">消息浏览</a>选消息生成。</p>
+  {% endif %}
+</div>
+
+<script>
+// htmx swap=none 的操作完成后刷新页面拿最新状态
+document.body.addEventListener("htmx:afterRequest", function (e) {
+  var path = e.detail.pathInfo?.requestPath || "";
+  if (path.startsWith("/shares/") && e.detail.successful) {
+    setTimeout(function () { location.reload(); }, 200);
+  }
+});
+</script>
+{% endblock %}

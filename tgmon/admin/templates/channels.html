@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}频道管理 · tgmon{% endblock %}
+{% block body %}
+<h1>频道管理</h1>
+<p class="sub">
+  不用手抄 ID、不用找私密频道链接。先在 TG 客户端里加入频道，然后点同步、勾选。
+  逐频道的详细配置点行内「配置」进编辑页。
+</p>
+
+<div class="card">
+  <div class="row">
+    <form hx-post="/channels/sync" hx-target="#sync-result" hx-swap="innerHTML"
+          hx-indicator="#sync-spin" style="margin:0">
+      <button class="btn">从我的账号同步</button>
+      <span id="sync-spin" class="htmx-indicator">拉取中，频道多时要等一会…</span>
+    </form>
+    <span class="spacer"></span>
+    <form method="get" action="/channels" class="row" style="margin:0;gap:6px">
+      <input name="q" value="{{ q }}" placeholder="搜名称 / @用户名 / ID"
+             style="width:200px">
+      <label style="margin:0;display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="only_on" value="1" {{ 'checked' if only_on }}>
+        只看监控中</label>
+      <button class="btn sm ghost">筛选</button>
+    </form>
+  </div>
+  <div id="sync-result"></div>
+</div>
+
+<div class="card">
+  {% include "fragments/channel_rows.html" %}
+</div>
+
+<p class="hint">
+  「对齐」= 比对 TG 最新消息与库里的，只补最近 {{ align_days }} 天内的缺口。
+  「同步」列全绿的频道无需理会；落后会在下轮对账（或点「对齐」）自动补。
+</p>
+{% endblock %}

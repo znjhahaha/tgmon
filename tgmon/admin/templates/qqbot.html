@@ -1,0 +1,282 @@
+{% extends "base.html" %}
+{% block title %}QQ 机器人 · tgmon{% endblock %}
+{% block body %}
+<h1>QQ 机器人</h1>
+<p class="sub">QQ 官方机器人接入：botpy SDK WebSocket 事件桥 + 群推送出站。</p>
+
+<div class="card">
+  <h2 style="margin-top:0">接入状态</h2>
+  <p style="margin:4px 0">
+    当前接入方式：<b>botpy 官方 SDK · WebSocket 网关</b>
+    {% if bridge_online %}
+    <span class="tag ok">事件桥在线（心跳 {{ bridge_seen }}）</span>
+    {% else %}
+    <span class="tag err">事件桥离线（最后心跳：{{ bridge_seen }}）</span>
+    {% endif %}
+  </p>
+  <p class="hint" style="margin:4px 0">
+    事件链路：QQ 平台 → botpy 容器（WS 出站）→ 本服务 <code>/qqbot/bridge</code>。
+    无需在 q.qq.com 配置回调地址；机器人被拉进群、被 @ 的消息都走这条链路，
+    群列表与「最近收到的消息」因此自动更新。
+  </p>
+  <p class="hint" style="margin:4px 0">
+    botpy 容器常驻在线也是<b>主动推送的前提</b>——平台要求发主动消息时机器人
+    保持 WS 网关在线。桥离线时推送 API 调用可能被平台拒绝。
+  </p>
+  <p style="margin:8px 0 0">
+    桥令牌：
+    {% if bridge_token_set %}<span class="tag ok">已配置</span>
+    {% else %}<span class="tag err">未配置（桥无法接入）</span>{% endif %}
+    <button class="btn sm ghost" hx-post="/qqbot/bridge-token/renew"
+            hx-target="#q-bridge-token" hx-swap="innerHTML">重新生成</button>
+    <span class="sub">重新生成后需同步更新服务器 botpy 容器的 BRIDGE_TOKEN 并重启容器。</span>
+  </p>
+  <div id="q-bridge-token"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">群内交互（命令 + AI）</h2>
+  <form hx-post="/qqbot/ai-config" hx-target="#q-ai-result" hx-swap="innerHTML">
+    <div class="chk">
+      <label><input type="checkbox" name="ai_enabled" {{ 'checked' if ai_enabled }}>启用 AI 对话</label>
+      <label><input type="checkbox" name="ai_fallback" {{ 'checked' if ai_fallback }}>非命令 @ 消息走 AI（关闭则仅 /ai 触发）</label>
+      <label><input type="checkbox" name="ai_agent" {{ 'checked' if ai_agent }}>AI 意图路由（说人话自动选命令，关闭则纯聊天）</label>
+      <label><input type="checkbox" name="daily_digest" {{ 'checked' if daily_digest }}>每日 21:00 召回摘要（当天互动过的群收当日汇总）</label>
+    </div>
+    <label>AI 人设（系统提示词，留空 = 默认助手人格）
+      <textarea name="ai_system" rows="3" style="width:100%;box-sizing:border-box"
+                placeholder="例如：你是 XX 游戏群的群友，说话简短随意…">{{ ai_system }}</textarea>
+    </label>
+    <label>Agent 与证据提示词（留空 = 默认；回答会自动附消息引用）
+      <textarea name="agent_system" rows="3" style="width:100%;box-sizing:border-box">{{ agent_system }}</textarea>
+    </label>
+    <p class="sub"><a href="/kb?tab=memory">对话记忆</a> · <a href="/kb?tab=retrieval">检索与索引</a> · <a href="/kb?tab=diagnostics">游戏订阅与发送诊断</a></p>
+    <p class="sub">AI 走后台「AI Provider」页配置的后端链（按优先级故障转移）。
+      意图路由开启时，"今天有什么新爆料"这类话会自动转成对应命令执行。</p>
+    <button class="btn">保存</button>
+  </form>
+  <div id="q-ai-result"></div>
+  <p class="hint" style="margin:8px 0 4px">群里 @ 机器人可用的命令（回复走被动通道，不占主动消息配额；单条 @ 最多回 5 次）：</p>
+  <table>
+    <tr><th>命令</th><th>作用</th></tr>
+    <tr><td><code>/latest 3</code></td><td>最新爆料（按发布时间，正文+整组图片；数字 1-5，明确五条会完整合成长图）</td></tr>
+    <tr><td><code>/translate [崩铁] 原文</code></td><td>按已审核知识库翻译；支持 /tr、翻译：原文，或 /translate #消息id</td></tr>
+    <tr><td><code>/new</code></td><td>只看本群还没看过的新消息（增量）</td></tr>
+    <tr><td><code>/search 关键词</code></td><td>模糊搜索最近 3 条命中</td></tr>
+    <tr><td><code>/ask 问题</code></td><td>结合检索证据回答并附消息引用</td></tr>
+    <tr><td><code>/related 消息id</code> · <code>/timeline 关键词</code></td><td>相关消息 / 日期演变</td></tr>
+    <tr><td><code>/remember</code> · <code>/forget</code></td><td>管理个人记忆（群成员互相隔离）</td></tr>
+    <tr><td><code>/game 原神</code></td><td>按游戏过滤最新</td></tr>
+    <tr><td><code>/peek 消息id</code></td><td>查看正文与完整图组；同组图片合为一张长图发送</td></tr>
+    <tr><td><code>/video 消息id</code></td><td>领取该条归档视频（720p 压缩版）</td></tr>
+    <tr><td><code>/stats</code> · <code>/status</code></td><td>今日统计 / 运行状态</td></tr>
+    <tr><td><code>/on</code> · <code>/off</code></td><td>本群推送开关</td></tr>
+    <tr><td><code>/ai 问题</code> / 任意文本</td><td>AI 问答（意图路由会自动选命令）</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">图片上传与备用中转</h2>
+  <p class="sub">图片默认直接上传到 QQ，无需图床。同组图片合为一张完整长图发送。
+    直接上传失败时，可用下方 GitHub 仓库作备用中转；未配置则尝试本站直链。
+    中转产生的过期图片由维护任务自动删除。</p>
+  <form hx-post="/qqbot/relay-config" hx-target="#q-relay-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>中转仓库（owner/name，公开仓库）<input name="relay_repo"
+             value="{{ relay_repo }}" placeholder="yourname/qq-media-relay"></label>
+      <label>Token（留空 = 不改）<input name="relay_token" type="password"
+             placeholder="{{ relay_token_mask or '未设置' }}" autocomplete="new-password"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="q-relay-result"></div>
+  <p style="margin:8px 0 0">
+    <button class="btn" hx-post="/qqbot/relay-test" hx-target="#q-relay-test"
+            hx-swap="innerHTML">测试中转</button>
+    <span class="sub">验证真实图片上传；默认直传 QQ，失败时使用备用中转。</span>
+  </p>
+  <div id="q-relay-test"></div>
+  <p class="hint">Token 生成：GitHub → Settings → Developer settings → Fine-grained tokens →
+    Generate；Repository access 只选该仓库，Permissions 里 Contents 设 Read and write。
+    仓库必须是<b>公开</b>的（raw URL 需匿名可读）。</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">快捷命令栏（q.qq.com 平台侧配置）</h2>
+  <p class="sub">群友 @ 机器人时，QQ 输入框上方会出现指令快捷入口（平台"指令"功能）。
+    需要在 QQ 开放平台配置，代码侧已兼容：</p>
+  <table>
+    <tr><th>指令名</th><th>指令描述</th><th>触发语（机器人收到）</th></tr>
+    <tr><td>最新</td><td>看最新爆料</td><td><code>/latest 2</code></td></tr>
+    <tr><td>未读</td><td>只看新消息</td><td><code>/new</code></td></tr>
+    <tr><td>搜索</td><td>搜索爆料</td><td><code>/search 关键词</code></td></tr>
+    <tr><td>统计</td><td>今日统计</td><td><code>/stats</code></td></tr>
+    <tr><td>帮助</td><td>命令列表</td><td><code>/help</code></td></tr>
+  </table>
+  <p class="hint">配置路径：q.qq.com → 机器人管理 → 开发设置 → 指令配置，
+    每条指令的触发语填上面第三列的文本。</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">接入凭证</h2>
+  <form hx-post="/qqbot/config" hx-target="#q-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>AppID<input name="app_id" value="{{ app_id }}" placeholder="102030405"></label>
+      <label>AppSecret（留空 = 不改）<input name="app_secret" type="password"
+             placeholder="{{ secret_mask or '未设置' }}" autocomplete="new-password"></label>
+    </div>
+    <p class="sub">AppSecret 即管理端「开发设置」页的<b>机器人密钥</b>——API 鉴权、
+      WS 桥凭证、Webhook 回调验签共用同一个凭证。</p>
+    <fieldset>
+      <legend>频道（都不勾 = 全部频道）</legend>
+      <div class="chk scroll">
+        {% for c in channels %}
+        <label><input type="checkbox" name="channel_ids" value="{{ c.id }}"
+               {{ 'checked' if c.id in channel_ids }}>{{ c.title }}</label>
+        {% endfor %}
+      </div>
+    </fieldset>
+    <div class="chk">
+      <label><input type="checkbox" name="qq_enabled" {{ 'checked' if qq_enabled }}>启用 QQ 群推送</label>
+      <label><input type="checkbox" name="include_dups" {{ 'checked' if include_dups }}>推送判重消息</label>
+      <label>每群每日上限<input name="daily_limit" value="{{ daily_limit }}" inputmode="numeric"
+             style="width:80px"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="q-result"></div>
+  <p style="margin:8px 0 0">
+    <button class="btn" hx-post="/qqbot/selfcheck" hx-target="#q-selfcheck"
+            hx-swap="innerHTML">自检密钥</button>
+    <span class="sub">用当前 AppSecret 换一次 access_token：能换到 = 密钥正确。</span>
+  </p>
+  <div id="q-selfcheck"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">后备：Webhook 回调（平台修复后可用）</h2>
+  <p class="hint" style="margin:4px 0">
+    2026-09-04 实测：管理端保存回调地址持续报 13007（平台校验服务问题），
+    故主通道已切 botpy WS 桥。webhook 路由仍保留，回调地址：
+    <code>{{ callback_url }}</code>
+  </p>
+  <p class="hint" style="margin:4px 0">
+    平台限制：<b>主动消息需平台审核开通权限</b>——个人主体机器人默认没有（报 40034105
+    时推送/测试消息发不出，属平台限制而非配置错误）。此时群内交互不受影响：
+    群友 @ 机器人用 <code>/latest</code> 等命令拉取内容（被动回复）。
+    已开通权限的机器人另受每群每天 1000 条、禁止链接限制（推送为纯文本摘要）。
+  </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">群</h2>
+  <p class="sub">机器人被拉进群后自动出现（进群事件经 WS 桥到达）；被 @ 也会自动补录。</p>
+  {% if groups %}
+  <table>
+    <tr><th>群</th><th>openid</th><th>状态</th><th>今日已发</th><th>最后推送</th><th>投递</th><th></th></tr>
+    {% for g in groups %}
+    <tr>
+      <td>
+        <form hx-post="/qqbot/groups/{{ g.id }}/update" hx-target="next .res" hx-swap="innerHTML"
+              style="display:flex;gap:4px;align-items:center">
+          <input name="nickname" value="{{ g.nickname }}" style="width:120px"
+                 placeholder="标个群名">
+          <button class="btn sm ghost">存</button>
+        </form>
+        <div class="res" style="font-size:11px"></div>
+      </td>
+      <td><code style="font-size:11px">{{ g.openid[:14] }}…</code></td>
+      <td>
+        <button class="pill {{ 'on' if g.enabled else 'off' }}"
+                hx-post="/qqbot/groups/{{ g.id }}/toggle" hx-swap="outerHTML">
+          {{ '推送中' if g.enabled else '已停用' }}</button>
+        {% if g.dropped %}<span class="tag err">机器人不在群</span>{% endif %}
+      </td>
+      <td>{{ g.sent_today or 0 }}</td>
+      <td class="dim">{{ g.last_sent_at|ago if g.last_sent_at else '—' }}</td>
+      <td class="dim" style="font-size:12px">
+        {% if g.pending %}<span class="tag warn">{{ g.pending }} 重试中</span>{% endif %}
+        {% if g.failed %}<span class="tag err">{{ g.failed }} 失败</span>{% endif %}
+        {% if not g.pending and not g.failed %}—{% endif %}
+      </td>
+      <td class="row">
+        <button class="btn sm ghost" hx-post="/qqbot/groups/{{ g.id }}/test"
+                hx-target="#qt-{{ g.id }}" hx-swap="innerHTML">发测试消息</button>
+        <span id="qt-{{ g.id }}" style="font-size:12px"></span>
+        <form method="post" action="/qqbot/groups/{{ g.id }}/delete"
+              onsubmit="return confirm('删除这个群？投递记录一并删除')">
+          <button class="btn sm danger">删</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">还没有群。把机器人拉进 QQ 群即可（WS 桥在线时自动记录），
+    或在下面手动录入 openid。</p>
+  {% endif %}
+  <details style="margin-top:8px">
+    <summary>手动添加群（进群事件丢失时用）</summary>
+    <form hx-post="/qqbot/groups/create" hx-target="#qg-result" hx-swap="innerHTML"
+          class="inline">
+      <label>group_openid<input name="openid" required placeholder="从「最近收到的消息」或日志里找"></label>
+      <label>群名（可选）<input name="nickname"></label>
+      <button class="btn sm">添加</button>
+    </form>
+    <div id="qg-result"></div>
+  </details>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">最近收到的消息</h2>
+  <p class="sub">群 @ 与私聊留痕（最新 50 条）。机器人没反应时先看这里：
+    有记录 = 事件到了、问题在处理或回复环节；没记录 = 事件没进来（查桥状态与容器日志）。</p>
+  {% if inbound %}
+  <table>
+    <tr><th>时间</th><th>来源</th><th>成员</th><th>内容</th><th>回复</th></tr>
+    {% for m in inbound %}
+    <tr>
+      <td class="dim" style="white-space:nowrap">{{ m.created_at|fmt_local }}</td>
+      <td>{{ m.source }}</td>
+      <td class="dim"><code style="font-size:11px">{{ m.member }}</code></td>
+      <td style="max-width:280px;word-break:break-all">{{ m.content[:80] }}</td>
+      <td class="dim" style="max-width:280px;word-break:break-all">
+        {{ (m.reply or '—')[:80] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">还没有收到过群消息。桥在线后在群里 @ 机器人说句话试试。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">最近投递</h2>
+  {% if recent %}
+  <table>
+    <tr><th>时间</th><th>群</th><th>消息</th><th>状态</th><th>尝试</th><th>错误</th></tr>
+    {% for d in recent %}
+    <tr>
+      <td class="dim" style="white-space:nowrap">{{ d.created_at|fmt_local }}</td>
+      <td>{{ d.group }}</td>
+      <td>
+        {% if d.message_id %}
+        <a href="/messages/{{ d.message_id }}/detail">#{{ d.message_id }}</a>
+        {% else %}<span class="dim">测试</span>{% endif %}
+      </td>
+      <td>
+        {% if d.status == 'done' %}<span class="tag ok">送达</span>
+        {% elif d.status == 'retry' %}<span class="tag warn">重试中</span>
+        {% elif d.status == 'failed' %}<span class="tag err">失败</span>
+        {% else %}<span class="tag">{{ d.status }}</span>{% endif %}
+      </td>
+      <td>{{ d.attempts }}</td>
+      <td class="dim" style="font-size:11px;max-width:260px;word-break:break-all">
+        {{ d.error or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">还没有投递记录。保存配置后点「发测试消息」验证链路。</p>
+  {% endif %}
+</div>
+{% endblock %}

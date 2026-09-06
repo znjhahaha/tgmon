@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}登录 · tgmon{% endblock %}
+{% block body %}
+<div class="card" style="max-width:380px;margin:60px auto">
+  <h1>tgmon 后台</h1>
+  <p class="sub">这个后台能改凭据、能看全部消息，等于账号控制权。</p>
+
+  {% if error %}<div class="flash err">{{ error }}</div>{% endif %}
+
+  {% if not has_account %}
+    <div class="flash err">
+      还没有后台账号。在 <code>.env</code> 里填 <code>TGMON_ADMIN_PASSWORD</code>，
+      然后 <code>docker compose restart admin</code> 即可建号（用户名固定 admin）。
+    </div>
+  {% else %}
+  <form method="post" action="/login">
+    <label>用户名<input name="username" value="admin" autocomplete="username" required></label>
+    <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="btn" style="width:100%">登录</button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

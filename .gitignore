@@ -1,0 +1,38 @@
+# 凭据与密钥 —— 绝不进 git
+.env
+secret.key
+
+# 会话文件等于账号完整访问权
+sessions/
+*.session
+*.session-journal
+
+# 运行时数据
+db/
+media/
+logs/
+models/
+caddy/data/
+caddy/config/
+
+# 上游参考代码（另有仓库，用 scripts/vendor-upstream.sh 拉取）
+vendor/
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest-tmp/
+.pytest_cache/
+
+# 仓库根目录的开发过程产物：一次性部署/验证脚本、截图、笔记。
+# 锚定根目录（开头 /），不影响 tests/ 里的正式测试文件
+/_*
+/test_lang_route.py
+/_*.{png,jpg,jpeg,txt,log}
+
+# 本地工具与截图产物
+.playwright-cli/
+output/
+
+# 一次性提交信息草稿
+docs/COMMIT_MSG.txt

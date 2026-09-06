@@ -1,0 +1,136 @@
+<div class="card" style="margin-top:8px;background:var(--panel2)">
+  <table>
+    <tr><th>频道</th><td>{{ m.channel }}</td>
+        <th>发布</th><td>{{ m.published_at|fmt_local('%Y-%m-%d %H:%M:%S') }}</td></tr>
+    <tr><th>翻译状态</th><td>{{ m.translate_status }}
+          {% if m.from_cache %}（命中缓存）{% endif %}</td>
+        <th>后端</th><td>{{ m.provider_name or '—' }} / {{ m.model or '—' }}</td></tr>
+    <tr><th>tokens</th><td>入 {{ m.tokens_in }} · 出 {{ m.tokens_out }}</td>
+        <th>成本</th><td>¥{{ '%.5f'|format(m.cost) }}</td></tr>
+    <tr><th>文本指纹</th><td><code>{{ m.text_hash or '—' }}</code></td>
+        <th>SimHash</th><td><code>{{ m.simhash or '—' }}</code></td></tr>
+    <tr><th>术语命中</th>
+        <td>{% for g in m.glossary_hits %}<span class="tag ok">{{ g }}</span>{% else %}<span class="dim">无</span>{% endfor %}</td>
+        <th>漏译</th>
+        <td>{% for g in m.glossary_miss %}<span class="tag warn">{{ g }}</span>{% else %}<span class="dim">无</span>{% endfor %}</td></tr>
+    <tr><th>判定语言</th><td><code>{{ m.lang_detected or '—' }}</code></td>
+        <th>检测游戏</th><td>{% if m.game_detected %}<span class="tag">{{ m.game_detected }}</span>{% else %}<span class="dim">未检测到</span>{% endif %}</td></tr>
+    <tr><th>内容类型</th>
+        <td>{% for t in m.topics %}<span class="tag">{{ t }}</span>{% else %}<span class="dim">—</span>{% endfor %}</td>
+        <th>版本</th><td>{% if m.version_tag %}<span class="tag">v{{ m.version_tag }}</span>{% else %}<span class="dim">—</span>{% endif %}</td></tr>
+    {% if m.game_scores and (m.game_scores.scores or m.game_scores.reasons) %}
+    <tr><th>判定依据</th><td colspan="3">
+      <div style="margin-bottom:4px">
+        {% for g, sc in m.game_scores.scores.items() %}
+        <span class="tag {{ 'ok' if loop.first }}">{{ g }} {{ sc }}</span>
+        {% else %}<span class="dim">无票数</span>{% endfor %}
+      </div>
+      <div class="dim" style="font-size:12px">
+        {% for r in m.game_scores.reasons %}· {{ r }}<br>{% endfor %}
+      </div>
+    </td></tr>
+    {% endif %}
+    {% if m.has_spoiler %}
+    <tr><th>剧透</th><td colspan="3">
+      文本 {{ m.spoiler_ranges|length }} 段
+      {% if m.media %} · 媒体 {{ m.media|selectattr('has_spoiler')|list|length }} 张封面{% endif %}
+      {% if not m.spoiler_ranges %}（译文经模型重写，区间只对原文有效，见下方）{% endif %}
+    </td></tr>
+    {% endif %}
+    <tr><th>实体</th>
+        <td colspan="3">{% for e in m.entities %}<span class="tag ok">{{ e.name }}</span>{% else %}<span class="dim">无</span>{% endfor %}</td></tr>
+    {% if m.duplicate_of %}
+    <tr><th>判重</th><td colspan="3">
+      原因 <code>{{ m.dup_reason }}</code> · 首条 #{{ m.duplicate_of }}</td></tr>
+    {% endif %}
+  </table>
+
+  {% if m.text_raw %}
+  <details>
+    <summary>原文{% if m.spoiler_ranges %}（含 {{ m.spoiler_ranges|length }} 段剧透，模糊处点击揭开）{% endif %}</summary>
+    {% if m.raw_segments %}
+    <pre>{% for seg, sp in m.raw_segments %}{% if sp %}<span class="spoiler">{{ seg }}</span>{% else %}{{ seg }}{% endif %}{% endfor %}</pre>
+    {% else %}
+    <pre>{{ m.text_raw }}</pre>
+    {% endif %}
+  </details>
+  {% endif %}
+
+  {% if m.text_dropped %}
+  <details>
+    <summary>被丢弃的外文段（判定为与中文段重复，不进正文）</summary>
+    <pre>{{ m.text_dropped }}</pre>
+  </details>
+  {% endif %}
+
+  {% if m.glossary_miss and role != 'guest' %}
+  <details>
+    <summary>把漏译词加进知识库（{{ m.glossary_miss|length }} 个）</summary>
+    <p class="hint">
+      漏译 = 术语表里有这个词、但译文里没出现对应中文。要么是模型没听话，
+      要么是这个词该有的译法还没录。补一条就等于以后每条都不会再错。
+    </p>
+    {% for g in m.glossary_miss %}
+    <form hx-post="/kb/quick-add" hx-target="this" hx-swap="innerHTML"
+          class="inline" style="margin-bottom:6px">
+      <input type="hidden" name="surface" value="{{ g }}">
+      <label style="flex:0 0 auto">原文
+        <input value="{{ g }}" disabled style="width:140px">
+      </label>
+      <label>规范中文译法
+        <input name="canonical_zh" placeholder="必填" required>
+      </label>
+      <label style="flex:0 0 110px">游戏
+        <select name="game">
+          <option value="">通用</option>
+          {% for gm in kb_games %}<option value="{{ gm }}">{{ gm }}</option>{% endfor %}
+        </select>
+      </label>
+      <button class="btn sm">加进知识库</button>
+    </form>
+    {% endfor %}
+  </details>
+  {% endif %}
+
+  {% if media %}
+  <h3>媒体</h3>
+  <table>
+    <tr><th>类型</th><th>尺寸</th><th>时长</th><th>原始大小</th><th>缩略图</th>
+        <th>归档视频</th><th>pHash</th><th>dHash</th></tr>
+    {% for x in media %}
+    <tr>
+      <td>{{ x.kind }}{% if x.has_spoiler %} <span class="tag warn">剧透</span>{% endif %}</td>
+      <td>{% if x.width %}{{ x.width }}×{{ x.height }}{% else %}—{% endif %}</td>
+      <td>{% if x.duration %}{{ x.duration }}s{% else %}—{% endif %}</td>
+      <td>{{ x.orig_bytes|human_bytes }}</td>
+      <td>{{ x.thumb_bytes|human_bytes }}</td>
+      <td>
+        {% if x.video_status == 'ok' and x.video_path %}
+          <a href="/media/private/{{ x.video_path }}" target="_blank"
+             rel="noreferrer">播放（{{ x.video_bytes|human_bytes }}）</a>
+        {% elif x.video_status %}
+          <span class="dim">{{ x.video_status }}</span>
+        {% else %}—{% endif %}
+      </td>
+      <td><code>{{ x.phash or '—' }}</code></td>
+      <td><code>{{ x.dhash or '—' }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if siblings %}
+  <h3>这条情报出现过的地方</h3>
+  <table>
+    <tr><th>ID</th><th>频道</th><th>时间</th></tr>
+    {% for sx in siblings %}
+    <tr><td>#{{ sx.id }}</td><td>{{ sx.channel }}</td>
+        <td class="dim">{{ sx.published_at|fmt_local }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if m.translate_error %}
+  <div class="flash err">{{ m.translate_error }}</div>
+  {% endif %}
+</div>

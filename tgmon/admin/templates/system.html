@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% block title %}系统 · tgmon{% endblock %}
+{% block body %}
+<h1>系统</h1>
+
+<div class="card">
+  <h2 style="margin-top:0">磁盘</h2>
+  <div class="grid g4">
+    <div class="kpi"><div class="n">{{ disk.free|human_bytes }}</div><div class="l">剩余空间</div></div>
+    <div class="kpi"><div class="n">{{ disk.media_bytes|human_bytes }}</div><div class="l">缩略图（{{ disk.media_files }} 个）</div></div>
+    <div class="kpi"><div class="n">{{ disk.db_bytes|human_bytes }}</div><div class="l">数据库</div></div>
+    <div class="kpi"><div class="n">{{ disk.used|human_bytes }}</div><div class="l">已用 / {{ disk.total|human_bytes }}</div></div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <form hx-post="/system/cleanup-media" hx-target="#cl-result" hx-swap="innerHTML">
+      <button class="btn sm ghost">立即清理媒体</button></form>
+    <form hx-post="/system/purge-cache" hx-target="#cl-result" hx-swap="innerHTML"
+          hx-confirm="清空翻译缓存？之后相同内容会重新调用 AI。">
+      <button class="btn sm ghost">清空翻译缓存</button></form>
+    <a class="btn sm ghost" href="/system/backup.zip">下载配置备份</a>
+    <form hx-post="/system/restart-worker" hx-target="#cl-result" hx-swap="innerHTML"
+          hx-confirm="重启 worker？监听会中断几秒，不会丢已入库消息。">
+      <button class="btn sm danger">重启 worker</button></form>
+  </div>
+  <div id="cl-result"></div>
+  <p class="hint">
+    磁盘满会让 SQLite 写失败、整个系统停摆。默认（不归档视频）日增应在几十 MB
+    量级；开了归档看上面「视频归档」卡片的独立 TTL 与总量上限。
+  </p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">媒体保留策略</h2>
+  <form hx-post="/system/media" hx-target="#m-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>消息保留天数（超期连同图片视频全删，0=不删）
+        <input name="message_ttl_days" value="{{ cfg.message_ttl_days }}" inputmode="numeric"></label>
+      <label>缩略图保留天数（0=不删）
+        <input name="media_ttl_days" value="{{ cfg.media_ttl_days }}" inputmode="numeric"></label>
+      <label>总量上限 MB（0=不限，超限按 LRU 淘汰）
+        <input name="media_max_mb" value="{{ cfg.media_max_mb }}" inputmode="numeric"></label>
+    </div>
+    <div class="inline">
+      <label>视频缩略图宽<input name="thumb_width" value="{{ cfg.thumb_width }}" inputmode="numeric"></label>
+      <label>图片下采样宽<input name="photo_width" value="{{ cfg.photo_width }}" inputmode="numeric"></label>
+      <label>WebP 质量<input name="webp_quality" value="{{ cfg.webp_quality }}" inputmode="numeric"></label>
+      <label style="flex:none;display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="ffmpeg_fallback" {{ 'checked' if cfg.ffmpeg_fallback }}>
+        无 thumb 时用 ffmpeg 抽首帧</label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="m-result"></div>
+  <p class="hint">消息保留按<b>发布时间</b>算：删除消息时一并删掉它的图片、归档视频与
+    缩略图文件。对齐窗口（{{ cfg.align_window_days }} 天）小于它，正常补进来的消息不会一入库就过期。</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">视频归档</h2>
+  <p class="hint">
+    下载 TG 原片 → 转码 720p mp4 → 存私有目录（Caddy 拒绝直发，只走后台
+    登录后的播放链接）。双闸门：这里的总开关 + 频道配置里的「归档视频」
+    都打开才会下载。转码在后台串行执行，同一时刻只有一路。
+  </p>
+  <div class="grid g4">
+    <div class="kpi"><div class="n">{{ disk.video_bytes|human_bytes }}</div><div class="l">归档视频占用</div></div>
+    <div class="kpi"><div class="n">{{ disk.video_files }}</div><div class="l">文件数</div></div>
+    <div class="kpi"><div class="n">{{ disk.video_rows }}</div><div class="l">DB 记录数</div></div>
+    <div class="kpi"><div class="n">{{ cfg.video_ttl_days }} 天</div><div class="l">当前 TTL</div></div>
+  </div>
+  <form hx-post="/system/video" hx-target="#v-result" hx-swap="innerHTML">
+    <div class="chk" style="margin:10px 0">
+      <label><input type="checkbox" name="video_enabled" {{ 'checked' if cfg.video_enabled }}>
+        <b style="color:var(--warn)">启用视频归档（最烧资源的路径，默认关）</b></label>
+    </div>
+    <div class="inline">
+      <label>单条源文件上限 MB
+        <input name="video_max_mb" value="{{ cfg.video_max_mb }}" inputmode="numeric"></label>
+      <label>时长上限 秒
+        <input name="video_max_seconds" value="{{ cfg.video_max_seconds }}" inputmode="numeric"></label>
+      <label>保留天数（0=不删）
+        <input name="video_ttl_days" value="{{ cfg.video_ttl_days }}" inputmode="numeric"></label>
+      <label>总量上限 MB（超限按 LRU 删）
+        <input name="video_max_total_mb" value="{{ cfg.video_max_total_mb }}" inputmode="numeric"></label>
+    </div>
+    <div class="inline">
+      <label>转码目标高度（短边不放大）
+        <input name="video_height" value="{{ cfg.video_height }}" inputmode="numeric"></label>
+      <label>x264 CRF（越大越小越糊，18-40）
+        <input name="video_crf" value="{{ cfg.video_crf }}" inputmode="numeric"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="v-result"></div>
+  <div class="row" style="margin-top:8px">
+    <form hx-post="/system/cleanup-media" hx-target="#v-cl-result" hx-swap="innerHTML">
+      <button class="btn sm ghost">立即清理（含视频）</button></form>
+  </div>
+  <div id="v-cl-result"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">频道对齐补拉</h2>
+  <p class="hint">
+    实时监听只覆盖 worker 在线时段 —— 重启/断线窗口漏掉的消息靠这个补回来：
+    每轮逐频道比对 TG 最新消息 ID 与库里的，<b>只补最近 N 天窗口内的缺口，
+    更早的不再回看</b>。频道管理页的「对齐」列显示每频道落后多少条。
+  </p>
+  <form hx-post="/system/catchup" hx-target="#cu-result" hx-swap="innerHTML">
+    <div class="chk" style="margin:10px 0">
+      <label><input type="checkbox" name="catchup_enabled" {{ 'checked' if cfg.catchup_enabled }}>
+        启用自动对齐补拉</label>
+    </div>
+    <div class="inline">
+      <label>对齐间隔（秒，最小 60）
+        <input name="catchup_interval" value="{{ cfg.catchup_interval }}" inputmode="numeric"></label>
+      <label>对齐窗口（天，只补窗口内）
+        <input name="align_window_days" value="{{ cfg.align_window_days }}" inputmode="numeric"></label>
+      <label>单频道单轮上限（条）
+        <input name="catchup_max_gap" value="{{ cfg.catchup_max_gap }}" inputmode="numeric"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div class="row" style="margin-top:8px">
+    <form hx-post="/system/catchup-now" hx-target="#cu-now-result" hx-swap="innerHTML">
+      <button class="btn sm ghost">立即对齐一轮</button></form>
+  </div>
+  <div id="cu-result"></div>
+  <div id="cu-now-result"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">翻译与预算</h2>
+  <form hx-post="/system/budget" hx-target="#b-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label>每日调用上限（0=不限）
+        <input name="ai_daily_call_limit" value="{{ cfg.ai_daily_call_limit }}" inputmode="numeric"></label>
+      <label>每日花费上限 元（0=不限）
+        <input name="ai_daily_cost_limit" value="{{ cfg.ai_daily_cost_limit }}"></label>
+      <label>超限行为<select name="ai_over_limit_action">
+        <option value="store_only" {{ 'selected' if cfg.ai_over_limit_action=='store_only' }}>
+          只存原文不翻译</option>
+        <option value="stop" {{ 'selected' if cfg.ai_over_limit_action=='stop' }}>
+          停止（仍会入库）</option>
+      </select></label>
+    </div>
+    <div class="chk">
+      <label><input type="checkbox" name="translate_enabled" {{ 'checked' if cfg.translate_enabled }}>启用翻译</label>
+      <label><input type="checkbox" name="translate_cache" {{ 'checked' if cfg.translate_cache }}>同文缓存</label>
+      <label><input type="checkbox" name="glossary_check" {{ 'checked' if cfg.glossary_check }}>译后术语校验</label>
+      <label><input type="checkbox" name="append_original" {{ 'checked' if cfg.append_original }}>RSS 译文后附原文</label>
+      <label><input type="checkbox" name="changelog_enabled" {{ 'checked' if cfg.changelog_enabled }}>监控 gachabase changelog</label>
+    </div>
+    <div class="inline">
+      <label>首次抓取只保留最新 N 条（0=全量）
+        <input name="changelog_first_run_keep" value="{{ cfg.changelog_first_run_keep }}" inputmode="numeric"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="b-result"></div>
+  <p class="hint">超限不会静默烧钱，也不会丢消息 —— 原文照样入库，只是不翻译。</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">检索、记忆与 Wiki</h2>
+  <form hx-post="/system/retrieval" hx-target="#retrieval-result" class="inline">
+    <label><input type="checkbox" name="retrieval_enabled" {{ 'checked' if cfg.retrieval_enabled }}>启用消息检索</label>
+    <label><input type="checkbox" name="embedding_enabled" {{ 'checked' if cfg.embedding_enabled }}>本地语义检索（默认开启）</label>
+    <label>批量<input name="embedding_batch_size" value="{{ cfg.embedding_batch_size }}" inputmode="numeric"></label>
+    <label><input type="checkbox" name="memory_enabled" {{ 'checked' if cfg.memory_enabled }}>QQ 记忆</label>
+    <label>记忆天数<input name="memory_ttl_days" value="{{ cfg.memory_ttl_days }}" inputmode="numeric"></label>
+    <label>最近轮数<input name="memory_recent_turns" value="{{ cfg.memory_recent_turns }}" inputmode="numeric"></label>
+    <label><input type="checkbox" name="wiki_sync_enabled" {{ 'checked' if cfg.wiki_sync_enabled }}>Wiki 自动同步</label>
+    <label>同步间隔小时<input name="wiki_fetch_interval_hours" value="{{ cfg.wiki_fetch_interval_hours }}" inputmode="numeric"></label>
+    <button class="btn">保存</button>
+  </form>
+  <div id="retrieval-result"></div>
+  <p class="hint">内置 BGE-small-zh 模型，使用 CPU，无需外部 embedding API 或密钥。模型不可用时仍可关键词检索；Wiki 条目审核通过后才用于翻译，QQ 可用 /translate 调用。</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">AI 用量（近 14 天，今天是 {{ today }}）</h2>
+  {% if usage %}
+  <table>
+    <tr><th>日期</th><th>调用</th><th>输入 tokens</th><th>输出 tokens</th><th>花费估算</th></tr>
+    {% for u in usage %}
+    <tr><td>{{ u.day }}</td><td>{{ u.calls }}</td><td>{{ u.tokens_in }}</td>
+        <td>{{ u.tokens_out }}</td><td>¥{{ '%.4f'|format(u.cost) }}</td></tr>
+    {% endfor %}
+  </table>
+  <p class="hint">花费按你在 Provider 页填的单价算。没填单价则显示 0。</p>
+  {% else %}
+  <p class="dim">还没有调用记录。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">日志级别</h2>
+  <form hx-post="/system/log-level" hx-target="#l-result" hx-swap="innerHTML"
+        class="inline">
+    <label>级别<select name="log_level">
+      {% for lv in ['DEBUG','INFO','WARNING','ERROR'] %}
+      <option value="{{ lv }}" {{ 'selected' if cfg.log_level==lv }}>{{ lv }}</option>
+      {% endfor %}
+    </select></label>
+    <button class="btn">保存</button>
+  </form>
+  <div id="l-result"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">事件日志</h2>
+  {% if events %}
+  <table>
+    <tr><th>时间</th><th>级别</th><th>来源</th><th>内容</th></tr>
+    {% for e in events %}
+    <tr><td class="dim">{{ e.created_at|fmt_local('%m-%d %H:%M:%S') }}</td>
+        <td><span class="tag {% if e.level=='error' %}err{% elif e.level=='warning' %}warn{% endif %}">{{ e.level }}</span></td>
+        <td class="dim">{{ e.source }}</td>
+        <td>{{ e.message|truncate_text(240) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="dim">没有事件。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="flash">
+    <b>换机器</b>：这台机 2026-09-30 到期。整个 <code>/opt/tgmon/</code> 已进 git，
+    换机时 <code>git clone</code> + <code>docker compose up -d</code> 就能恢复。
+    但要另外搬两样<b>不在 git 里</b>的东西：<code>secret.key</code>（否则已存的密钥解不开）
+    和 <code>sessions/</code>（否则要重新验证码登录）。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">分享链接与防刷</h2>
+  <p class="hint" style="margin-top:0">
+    管理员在消息页可对单条消息生成分享短链（<code>/s/{token}</code>），持有者免登录
+    查看该条内容并下载图片/视频。应用内已按 IP 限流：分享页 20 次/分、下载
+    10 次/分。域名走 Cloudflare 橙云时可再叠一层边缘限流（强烈建议）：
+  </p>
+  <pre>Cloudflare 控制台 → Security → WAF → Rate limiting rules：
+规则 1：URI Path starts with "/s/"          → 30 requests / 10 seconds / per IP → Block 1m
+规则 2：URI Path starts with "/media/private/" → 30 requests / 10 seconds / per IP → Block 1m</pre>
+  <p class="hint">
+    短链 token 为随机 96 bit，库中只存哈希；撤销与过期都在服务端校验。
+    分享页不含站内其它链接，拿到一条链接的人无法顺藤摸到别的消息。
+  </p>
+</div>
+{% endblock %}

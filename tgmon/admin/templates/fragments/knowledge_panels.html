@@ -1,0 +1,327 @@
+{% if tab == 'retrieval' %}
+{# ---- 检索与索引 ---- #}
+<style>
+.kb-set{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,max-content));
+  gap:10px 18px;align-items:center}
+.kb-set label{display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:var(--fg);flex:none}
+.kb-set label.plain{color:var(--dim)}
+.kb-set input[type=number]{width:76px;margin:0;padding:5px 7px;text-align:center}
+</style>
+<div class="card" style="margin-top:0">
+  <div class="kb-sec"><h2>索引状态</h2>
+    <span class="dim">已索引消息低于消息总数属正常（历史消息可能已被清理）</span></div>
+  <div class="grid g4">
+    <div class="kpi"><div class="n">{{ index_counts.get('message',0) }}</div>
+      <div class="l">已索引消息（总消息 {{ message_count }}）</div></div>
+    <div class="kpi"><div class="n">{{ index_counts.get('wiki',0) }}</div><div class="l">参考资料</div></div>
+    <div class="kpi"><div class="n">{{ index_counts.get('memory',0) }}</div><div class="l">记忆条目</div></div>
+    <div class="kpi"><div class="n">{{ vector_count }}</div><div class="l">有效向量（内置模型）</div></div>
+  </div>
+  {% if center_cfg.EMBEDDING_LAST_ERROR %}
+  <p class="err" style="margin:10px 0 0">语义检索异常：{{ center_cfg.EMBEDDING_LAST_ERROR }}</p>
+  {% elif not center_cfg.EMBEDDING_ENABLED %}
+  <p class="warn" style="margin:10px 0 0">语义检索已关闭，当前仅关键词检索</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="kb-sec"><h2>参数设置</h2>
+    <span class="dim">保存后立即生效，无需重启</span></div>
+  <form hx-post="/system/retrieval" hx-target="#settings-result">
+    <fieldset>
+      <legend>检索</legend>
+      <div class="kb-set">
+        <label><input type="checkbox" name="retrieval_enabled" {% if center_cfg.RETRIEVAL_ENABLED %}checked{% endif %}>启用检索</label>
+        <label><input type="checkbox" name="embedding_enabled" {% if center_cfg.EMBEDDING_ENABLED %}checked{% endif %}>语义检索（内置向量）</label>
+        <label class="plain">索引批量
+          <input type="number" name="embedding_batch_size" min="1" max="128" value="{{ center_cfg.EMBEDDING_BATCH_SIZE }}">
+        </label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>对话记忆</legend>
+      <div class="kb-set">
+        <label><input type="checkbox" name="memory_enabled" {% if center_cfg.MEMORY_ENABLED %}checked{% endif %}>启用对话记忆</label>
+        <label class="plain">历史保留
+          <input type="number" name="memory_ttl_days" min="1" max="365" value="{{ center_cfg.MEMORY_TTL_DAYS }}"> 天
+        </label>
+        <label class="plain">上下文
+          <input type="number" name="memory_recent_turns" min="2" max="30" value="{{ center_cfg.MEMORY_RECENT_TURNS }}"> 条
+        </label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>来源自动同步</legend>
+      <div class="kb-set">
+        <label><input type="checkbox" name="wiki_sync_enabled" {% if center_cfg.WIKI_SYNC_ENABLED %}checked{% endif %}>定时同步 Wiki 来源</label>
+        <label class="plain">间隔
+          <input type="number" name="wiki_fetch_interval_hours" min="1" value="{{ center_cfg.WIKI_FETCH_INTERVAL_HOURS }}"> 小时
+        </label>
+      </div>
+    </fieldset>
+    <button class="btn">保存设置</button>
+  </form>
+  <div id="settings-result"></div>
+</div>
+
+<div class="card">
+  <div class="kb-sec"><h2>检索验证</h2>
+    <span class="dim">按消息与参考资料检索，核对召回效果</span></div>
+  <form hx-get="/kb/lookup" hx-target="#lookup-result" class="inline">
+    <input name="q" placeholder="检索内容，如：斯科特 专武" aria-label="检索内容" required style="flex:2 1 240px">
+    <label style="flex:none;min-width:0"><select name="game" aria-label="游戏" style="width:auto">
+      <option value="">全部游戏</option>{% for game in center_games %}<option>{{ game }}</option>{% endfor %}</select></label>
+    <label style="flex:none;min-width:0"><select name="source" aria-label="资料类型" style="width:auto">
+      <option value="">消息与资料</option><option value="message">消息</option><option value="wiki">参考资料</option></select></label>
+    <button class="btn">检索</button>
+  </form>
+  <div id="lookup-result" class="dim" style="padding:8px 0 0;font-size:12px">输入内容后点击「检索」，结果会显示在这里</div>
+</div>
+{% endif %}
+
+{% if tab == 'memory' %}
+{# ---- 对话记忆 ---- #}
+<style>
+.conv-card{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px;
+  background:var(--panel);box-shadow:0 1px 4px rgba(0,0,0,.22)}
+.conv-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.conv-head .scope{font-weight:600;font-size:14px}
+.conv-head .id{font-size:11px}
+.conv-head .time{margin-left:auto;font-size:12px;color:var(--dim)}
+.fact-row{display:grid;grid-template-columns:88px minmax(160px,420px) max-content;gap:8px;
+  align-items:center;margin:6px 0}
+.fact-row .key{text-align:center;background:var(--panel2);border-radius:6px;
+  padding:5px 8px;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.fact-row input{margin:0}
+.fact-row .btn{margin:0;justify-self:start}
+.conv-add{display:grid;grid-template-columns:minmax(160px,420px) max-content;gap:8px;
+  align-items:center;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+.conv-add input{margin:0}
+.conv-add .btn{margin:0;justify-self:start}
+.conv-forget{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  padding:8px 10px;border:1px solid rgba(244,99,94,.35);border-radius:8px;
+  background:rgba(244,99,94,.06)}
+.conv-forget input{flex:1 1 160px;margin:0;max-width:420px}
+.conv-forget .btn{margin:0}
+@media(max-width:720px){
+  .conv-head .time{margin-left:0;flex-basis:100%}
+  .fact-row{grid-template-columns:72px 1fr auto}
+  .conv-add{grid-template-columns:1fr}
+}
+</style>
+<div class="card" style="margin-top:0">
+  <div class="kb-sec"><h2>成员档案</h2>
+    <span class="dim">{{ member_profiles | length }} 位成员 · 昵称与个人事实直接落库（记忆 v2）</span></div>
+  {% if member_profiles %}
+  <div class="table-scroll"><table>
+    <thead><tr><th>称呼</th><th>个人事实</th><th>最近更新</th></tr></thead>
+    <tbody>
+    {% for p in member_profiles %}
+    <tr>
+      <td><b>{{ p.nickname or '（未设置）' }}</b>
+        <div class="dim" style="font-size:11px">{{ p.member_openid[:10] }}…</div></td>
+      <td>{% set ns = namespace(has=false) %}
+        {% for k, v in (p.facts or {}).items() %}
+          {% if v is mapping %}{% set t = v.get('text') or '' %}{% else %}{% set t = v %}{% endif %}
+          {% if t %}<span class="tag">{{ t }}</span>{% set ns.has = true %}{% endif %}
+        {% endfor %}
+        {% if not ns.has %}<span class="dim">—</span>{% endif %}</td>
+      <td class="dim" style="white-space:nowrap">{{ p.updated_at | ago }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="dim" style="margin:0">还没有成员设置称呼或保存个人事实。群成员对我说「叫我XX」「记住我喜欢流萤」或用 /nickname、/remember 命令后会出现在这里。</p>
+  {% endif %}
+</div>
+
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:14px">
+  <div class="kb-sec" style="margin:0"><h2>会话与个人记忆</h2>
+    <span class="dim">{{ memories | length }} 个会话 · 按最近活跃排序</span></div>
+  <a href="/kb?tab=retrieval" class="btn sm ghost" style="margin:0">记忆设置</a>
+</div>
+{% if center_cfg.MEMORY_LAST_ERROR %}
+<div class="flash err" style="margin:10px 0">记忆模块异常：{{ center_cfg.MEMORY_LAST_ERROR }}</div>
+{% endif %}
+{% if not center_cfg.MEMORY_ENABLED %}
+<div class="flash" style="margin:10px 0">对话记忆当前<b>未启用</b>，新会话不会积累记忆。可在<a href="/kb?tab=retrieval">记忆设置</a>中开启。</div>
+{% endif %}
+
+{% for conv in memories %}
+<div class="conv-card">
+  <div class="conv-head">
+    {% set scope_label = {'group_v2':'群话题','member_v2':'群内个人','private_v2':'私聊'}.get(conv.scope_type, '旧记录归档') %}
+    {% set scope_cls = {'group_v2':'','member_v2':'ok','private_v2':'warn'}.get(conv.scope_type, '') %}
+    {# 记忆 v2：能对上成员档案就显示昵称（member_v2 的 openid 在 state 里） #}
+    {% set _oid = (conv.context_state or {}).get('member') if conv.scope_type == 'member_v2' else (conv.scope_id if conv.scope_type == 'private_v2' else '') %}
+    {% set _nick = member_nicknames.get(_oid or '') %}
+    <span class="tag {{ scope_cls }}" style="font-size:12px">{{ scope_label }}</span>
+    {% if _nick %}<b style="font-size:13px">{{ _nick }}</b>{% endif %}
+    <span class="scope">#{{ conv.id }}</span>
+    <code class="id dim">{{ conv.scope_id }}</code>
+    <span class="time">{{ conv.updated_at | ago }}</span>
+  </div>
+  {% if conv.summary %}
+  <details style="margin:8px 0 2px">
+    <summary>对话摘要</summary>
+    <pre class="evidence">{{ conv.summary }}</pre>
+  </details>
+  {% endif %}
+  {% if conv.facts %}
+  <div style="margin-top:8px">
+    {% for key, fact in (conv.facts or {}).items() %}
+    {% set fact_text = fact.get('text') if fact is mapping else (fact if fact is string else '') %}
+    {% if fact_text %}
+    <div class="fact-row">
+      <span class="key" title="{{ key }}">{{ key or '事实' }}</span>
+      <form action="/kb/memory/{{ conv.id }}/save" method="post" style="display:contents">
+        <input type="hidden" name="key" value="{{ key }}">
+        <input name="value" value="{{ fact_text }}" aria-label="记忆内容">
+        <button class="btn sm ghost">保存</button>
+      </form>
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if conv.scope_type in ['member_v2','private_v2'] %}
+  <form action="/kb/memory/{{ conv.id }}/save" method="post" class="conv-add">
+    <input name="value" placeholder="输入自然语言事实，机器人自动提炼标签" aria-label="新增个人记忆" required>
+    <button class="btn sm ghost">添加</button>
+  </form>
+  {% endif %}
+  <form action="/kb/memory/{{ conv.id }}/forget" method="post" class="conv-forget"
+        onsubmit="var q=this.query.value.trim();return confirm(q ? '忘记与「' + q + '」匹配的记忆？' : '确认清除该会话的全部记忆？此操作不可撤销')">
+    <input name="query" placeholder="按关键词删除单条记忆" aria-label="要忘记的内容">
+    <button class="btn sm danger">忘记</button>
+    <span class="dim" style="font-size:11px">输入关键词删单条；留空提交则清空该会话全部记忆</span>
+  </form>
+</div>
+{% else %}
+<div class="card" style="text-align:center;padding:36px 16px">
+  <p class="dim" style="margin:0 0 6px">还没有对话记忆</p>
+  <p class="hint" style="margin:0">群成员对机器人说「/remember 事实」或自然交流后，记忆会积累在这里</p>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if tab == 'diagnostics' %}
+{# ---- 诊断 ---- #}
+<div class="card" style="margin-top:0">
+  <div class="kb-sec"><h2>发送异常</h2>
+    <span class="dim">需要人工核实的推送事件</span></div>
+  {% for event in events %}
+  <div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span class="tag {{ 'warn' if event.status == 'review' else 'ok' }}">{{ '待核实' if event.status == 'review' else '等待重试' }}</span>
+      <code style="font-size:11px">{{ event.event_key }}</code>
+      <span class="dim" style="font-size:12px;margin-left:auto">{{ event.updated_at | ago }}</span>
+    </div>
+    <details style="margin-top:6px">
+      <summary>事件详情</summary>
+      <pre>{{ event.parts | tojson(indent=2) }}</pre>
+    </details>
+    <form method="post" action="/kb/event/{{ event.event_key }}/resolve" style="display:flex;gap:6px;margin-top:4px">
+      <button class="btn sm" name="state" value="done">核实为已送达</button>
+      <button class="btn sm ghost" name="state" value="failed">核实为未送达</button>
+    </form>
+  </div>
+  {% else %}
+  <p class="dim" style="margin:0">没有待处理的发送异常。</p>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <div class="kb-sec"><h2>群订阅</h2>
+    <span class="dim">每个群接收哪些游戏的推送</span></div>
+  {% for group in subscriptions %}
+  <div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0">
+    <form hx-post="/kb/subscription/{{ group.id }}" hx-target="next .res">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+        <b>{{ group.nickname or group.group_openid }}</b>
+        {% if not group.enabled %}<span class="tag err">已停用</span>{% endif %}
+        <code class="dim" style="font-size:11px">{{ group.group_openid }}</code>
+      </div>
+      <div class="chk">
+        <label><input type="checkbox" name="all_games" {% if not group.games %}checked{% endif %}>全部游戏</label>
+        {% for game in center_games %}
+        <label><input type="checkbox" name="games" value="{{ game }}" {% if game in (group.games or []) %}checked{% endif %}>{{ game }}</label>
+        {% endfor %}
+        <button class="btn sm">保存</button>
+      </div>
+    </form><span class="res"></span>
+  </div>
+  {% else %}
+  <p class="dim" style="margin:0">暂无接入群。</p>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <div class="kb-sec"><h2>消息分类</h2>
+    <span class="dim">游戏归属判定结果与人工确认</span>
+    <span class="spacer"></span>
+    <button class="btn sm" hx-post="/kb/job/unified_backfill" hx-target="#classify-result">补识别历史消息</button>
+  </div>
+  <div id="classify-result"></div>
+  <div class="table-scroll"><table>
+    <tr><th>消息</th><th>依据</th><th>人工确认</th></tr>
+    {% for msg in classifications %}
+    <tr>
+      <td style="max-width:340px">
+        <a href="/messages?q={{ (msg.text_zh or msg.text_raw or '')[:30]|urlencode }}">#{{ msg.id }}</a>
+        <div class="dim" style="font-size:12px">{{ (msg.text_zh or msg.text_raw or '')[:150] }}</div>
+      </td>
+      <td>
+        <span class="tag {{ 'ok' if msg.game_detected else '' }}">{{ (msg.game_scores or {}).get('method','待识别') }}</span>
+        <details><summary>判断依据</summary><pre>{{ msg.game_scores | tojson(indent=2) }}</pre></details>
+      </td>
+      <td>
+        <form hx-post="/kb/classification/{{ msg.id }}" hx-target="next .res" style="display:flex;gap:4px;align-items:center">
+          <select name="game" aria-label="确认游戏" style="width:auto">
+            <option value="">待识别</option>
+            {% for game in center_games %}<option {% if game == msg.game_detected %}selected{% endif %}>{{ game }}</option>{% endfor %}
+          </select>
+          <button class="btn sm">保存</button>
+        </form><span class="res"></span>
+      </td>
+    </tr>
+    {% endfor %}
+  </table></div>
+</div>
+{% endif %}
+
+{% if tab in ['retrieval','sources','diagnostics'] %}
+<div class="card">
+  <div class="kb-sec"><h2>任务记录</h2>
+    <span class="dim">知识库后台任务的执行历史</span>
+    <span class="spacer"></span>
+    {% if tab == 'retrieval' %}
+    <button class="btn sm" hx-post="/kb/job/knowledge_index" hx-target="#job-result">重建资料索引</button>
+    {% endif %}
+  </div>
+  {% if tab == 'retrieval' %}<div id="job-result"></div>{% endif %}
+  <div class="table-scroll"><table>
+    <tr><th>任务</th><th>状态</th><th>时间</th><th>结果</th></tr>
+    {% for job in jobs %}
+    <tr>
+      <td><b>#{{ job.id }}</b> {{ job.kind }}</td>
+      <td><span class="tag {{ {'done':'done','running':'running','failed':'failed'}.get(job.status,'') }}">{{ job.status }}</span></td>
+      <td class="dim" style="white-space:nowrap">{{ job.created_at | ago }}</td>
+      <td>
+        {% if job.error %}
+          <span class="err">{{ job.error }}</span>
+        {% elif job.result is mapping %}
+          {% for k, v in job.result.items() %}<span class="tag">{{ k }} {{ v }}</span> {% endfor %}
+        {% else %}
+          {{ job.result or '' }}
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="dim">暂无任务</td></tr>
+    {% endfor %}
+  </table></div>
+</div>
+{% endif %}

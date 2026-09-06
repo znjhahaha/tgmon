@@ -1,0 +1,46 @@
+<div class="task-card" id="task-card-{{ t.id }}"
+     {% if not t.is_finished %}
+     hx-get="{{ t.poll_url }}" hx-trigger="every 1.5s" hx-swap="outerHTML"
+     {% endif %}>
+  <div class="task-head">
+    <div class="task-title">
+      {% if not t.is_finished %}
+        <span class="spinner"></span>
+      {% elif t.is_success %}
+        <span class="dot up"></span>
+      {% else %}
+        <span class="dot"></span>
+      {% endif %}
+      <span>{{ t.title }}</span>
+    </div>
+    <span class="spacer"></span>
+    <span class="tag {{ 'ok' if t.is_success else ('err' if t.is_finished else 'warn') }}">
+      {% if t.is_success %}已完成{% elif t.is_finished %}失败{% elif t.status == 'running' %}执行中{% else %}排队中{% endif %}
+    </span>
+  </div>
+
+  <div class="progress-track">
+    <div class="progress-fill {{ 'indeterminate' if t.percent is none else 'active' }}"
+         style="width: {{ t.percent if t.percent is not none else 100 }}%"></div>
+  </div>
+
+  <div class="task-foot">
+    <span>{{ t.detail }}</span>
+    {% if t.percent is not none %}
+    <b style="font-family:ui-monospace,monospace">{{ t.percent }}%</b>
+    {% endif %}
+  </div>
+
+  {% if t.is_finished %}
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    {% if t.kind in ('backfill', 'catchup_round', 'catchup_now') %}
+    <a href="/messages" class="btn sm">去消息浏览查看</a>
+    {% elif t.kind in ('kb_smart_sync', 'kb_import', 'kb_import_gachabase') %}
+    <a href="/kb" class="btn sm">刷新知识库条目</a>
+    {% elif t.kind == 'sync_dialogs' %}
+    <a href="/channels" class="btn sm">查看最新频道列表</a>
+    {% endif %}
+    <button type="button" class="btn sm ghost" onclick="this.closest('.task-card').remove()">关闭提示</button>
+  </div>
+  {% endif %}
+</div>

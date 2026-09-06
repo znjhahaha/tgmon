@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}去重复查 · tgmon{% endblock %}
+{% block body %}
+{% set rn = {"text_exact": "文本精确", "simhash": "文本近似", "phash": "同图",
+             "album": "相册拆分"} %}
+<h1>去重复查</h1>
+<p class="sub">
+  判重记录 {{ total }} 条{% if overridden %}，已人工翻案 {{ overridden }} 条{% endif %}。
+  命中重复<b>不丢弃</b>，只标记指向首条。这里是重复消息的专门界面 ——
+  消息页默认只显示首发；「相册拆分」是同一相册被历史入库 bug 拆散后
+  修复脚本合并的残余标记，媒体已并入首发，无需处理。
+</p>
+
+<div class="card">
+  <h2 style="margin-top:0">阈值</h2>
+  <form hx-post="/dedupe/config" hx-target="#cfg-result" hx-swap="innerHTML">
+    <div class="inline">
+      <label style="flex:none;display:flex;align-items:center;color:var(--fg)">
+        <input type="checkbox" name="dedup_enabled" {{ 'checked' if cfg.enabled }}>启用去重</label>
+      <label>回看窗口（天）<input name="window_days" value="{{ cfg.window_days }}" inputmode="numeric"></label>
+      <label>SimHash 距离<input name="simhash" value="{{ cfg.simhash }}" inputmode="numeric"></label>
+      <label>pHash 距离<input name="phash" value="{{ cfg.phash }}" inputmode="numeric"></label>
+      <label>短文本下限（字）<input name="min_len" value="{{ cfg.min_len }}" inputmode="numeric"></label>
+    </div>
+    <button class="btn">保存</button>
+  </form>
+  <div id="cfg-result"></div>
+  <p class="hint">
+    三层从便宜到贵：<b>① 消息 ID</b>（唯一索引，零成本，防重启重放）→
+    <b>② 文本指纹</b>（归一化后 SHA-256 精确匹配，再用 SimHash 抓改了几个字的转发）→
+    <b>③ 图片感知哈希</b>（pHash 与 dHash 取距离较小者，抓「同图配不同文案」与纯图转发）。
+    第 3 层纯本地计算，不调 AI。
+  </p>
+  <details>
+    <summary>图片判重能抓什么、抓不到什么（实测数据）</summary>
+    <table style="margin-top:6px">
+      <tr><th>改动方式</th><th>距离</th><th>阈值 5 下</th></tr>
+      <tr><td>重新编码 / 缩放</td><td>0</td><td class="ok">抓到</td></tr>
+      <tr><td>强 JPEG 压缩（q25）</td><td>1</td><td class="ok">抓到</td></tr>
+      <tr><td>半透明文字水印</td><td>1</td><td class="ok">抓到</td></tr>
+      <tr><td>不透明色块水印</td><td>1</td><td class="ok">抓到（靠 dHash）</td></tr>
+      <tr><td>整体调亮 18%</td><td>2</td><td class="ok">抓到</td></tr>
+      <tr><td>裁掉边缘 3%</td><td>11</td><td class="err">抓不到</td></tr>
+      <tr><td>加 20px 边框</td><td>18</td><td class="err">抓不到</td></tr>
+      <tr><td>完全不同的图</td><td>8 起（中位 19）</td><td class="ok">不误判</td></tr>
+    </table>
+    <p class="hint">
+      裁剪与加边框是感知哈希的<b>固有局限</b>（整幅图的低频结构变了），
+      调高阈值也解决不了，只会开始误判。这类重复靠第 2 层的文本指纹兜。
+      阈值放到 8 以上就会出现误判 —— 建议保持 5。
+    </p>
+  </details>
+</div>
+
+<div class="card">
+  <div class="row">
+    <a class="btn sm {{ 'ghost' if reason }}" href="/dedupe">全部 {{ total }}</a>
+    {% for k, v in by_reason.items() %}
+    <a class="btn sm {{ '' if reason==k else 'ghost' }}" href="/dedupe?reason={{ k }}">
+      {{ rn.get(k, k) }} {{ v }}</a>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="card">
+  <table>
+    <tr><th>时间</th><th>频道</th><th>原因</th><th>内容片段</th>
+        <th>首发</th><th>出现在</th><th></th></tr>
+    {% for i in items %}
+    <tr id="d-{{ i.id }}">
+      <td class="dim">{{ i.published_at|fmt_local }}</td>
+      <td>{{ i.channel }}</td>
+      <td><span class="tag warn">{{ rn.get(i.reason, i.reason) }}</span></td>
+      <td class="dim">{{ i.text|truncate_text(140) }}</td>
+      <td class="dim">#{{ i.first_id }} {{ i.first_channel }}<br>
+          {{ i.first_at|fmt_local }}</td>
+      <td>
+        <details><summary>{{ i.count }} 个频道</summary>
+          {% for a in i.appeared %}<span class="tag">{{ a }}</span>{% endfor %}
+        </details>
+      </td>
+      <td class="row">
+        <button class="btn sm ghost" hx-post="/dedupe/{{ i.id }}/release"
+                hx-target="#d-{{ i.id }} .act" hx-swap="innerHTML"
+                hx-confirm="放行这条？之后它会作为独立消息出现在 RSS/API 里。">
+          误判·放行</button>
+        <a class="btn sm ghost" href="/messages?q={{ i.text[:20] }}">看全文</a>
+        <span class="act" style="font-size:12px"></span>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="dim">还没有判重记录。</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% if pages > 1 %}
+<div class="pager">
+  {% if page > 1 %}<a href="/dedupe?page={{ page-1 }}&reason={{ reason }}">上一页</a>{% endif %}
+  <span class="dim">{{ page }} / {{ pages }}</span>
+  {% if page < pages %}<a href="/dedupe?page={{ page+1 }}&reason={{ reason }}">下一页</a>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

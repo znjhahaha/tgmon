@@ -1,0 +1,36 @@
+<div class="card">
+  <div class="kb-sec"><h2>参考资料</h2>
+    <span class="dim">Wiki 抓取的背景资料，发布后参与检索与回答</span></div>
+  {% if documents %}
+  <div class="table-scroll"><table>
+    <thead><tr><th>标题</th><th>版本</th><th>资料状态</th><th>译名审核</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for doc in documents %}
+    <tr>
+      <td style="max-width:360px">
+        <details>
+          <summary><b>{{ doc.title }}</b>{% if doc.entity %} <span class="dim">→ {{ doc.entity }}</span>{% endif %}</summary>
+          <pre class="evidence">{{ doc.content[:3000] }}</pre>
+        </details>
+      </td>
+      <td class="dim">{{ doc.revision_id or '—' }}</td>
+      <td><span class="tag {{ {'active':'ok','pending':'warn','rejected':'err'}.get(doc.document_status,'') }}">{{ {'active':'已发布','disabled':'已停用','rejected':'已拒绝','pending':'待审核'}.get(doc.document_status, doc.document_status) }}</span></td>
+      <td><span class="tag {{ {'active':'ok','pending':'warn','rejected':'err'}.get(doc.status,'') }}">{{ {'active':'已确认','pending':'待审核','rejected':'未采用','disabled':'已停用'}.get(doc.status, doc.status) }}</span></td>
+      <td>
+        <form method="post" action="/kb/document/{{ doc.id }}" style="display:flex;gap:4px;align-items:center">
+          <select name="status" aria-label="资料状态">
+            <option value="active">发布资料</option>
+            <option value="pending">待审核</option>
+            <option value="disabled">停用资料</option>
+          </select>
+          <button class="btn sm">保存</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="dim" style="margin:0">暂无参考资料。到「来源同步」添加 Wiki 来源并同步后，抓取的页面会出现在这里。</p>
+  {% endif %}
+</div>

@@ -1,0 +1,8 @@
+topic,patterns,case_sensitive,note
+角色,新角色|角色新增|角色改动|角色文本改动|五星角色|5\*character|自机|代理人改动|new character|character changes,0,从真实样本取：msg 3「角色改动（2）」、msg 32「7.4 5*character」
+卡池,卡池|banner|复刻|rerun|up池|限定池|抽卡|pull for|gacha(?!base),0,msg 12「didn't pull for Elation」、msg 39「7.2卡池」。gacha 要排除 gachabase —— 内鬼站域名 zzz.gachabase.net 出现在几乎每条数据更新里
+剧情,剧情|主线|支线|过场|演出|PV|预告|trailer|cutscene|story|世界观|台词,0,
+数值改动,深测|数值|命座|C\d\b|减抗|增伤|倍率|面板|机制|屏障|伤害|加成|技能范围|平衡性|buff|nerf|multiplier,0,msg 13「新 Boss 机制：血脑屏障」、msg 26「女仆深测」、msg 8「真实伤害机制解析」
+活动,活动|新活动|限时|庆典|签到|event\b,0,msg 44 自带 #活动 标签
+版本更新,版本更新|更新日志|changelog|hotfix|热修复|维护|停服|beta \d|版本前瞻|直播|special program,0,msg 20「v3.2.12 Rev. 18560506 Hotfix Update」
+资源解包,预下载|解包|资材|素材|assets|revision|Rev\.|_diff|Music_diff|数据更新|文件大小|\bV\d\b|zstd|TextMap|GB\b|MB\b,0,msg 17「7.0.52_7.0.53_Music_diff」、msg 19「V4 1.96GB」、msg 29「预下载大小」
