@@ -81,6 +81,45 @@ async def test_generic_source_replay_and_edit_use_existing_content_pipeline():
     assert source_adapters.checkpoint(cid) == "page-2"
 
 
+@pytest.mark.asyncio
+async def test_processing_ingest_commits_source_links_before_return(monkeypatch):
+    from types import SimpleNamespace
+    from tgmon.worker import processing
+
+    with session_scope() as s:
+        channel = Channel(tg_id="processing-test", title="Platform test", theme="generic", enabled=True)
+        s.add(channel)
+        s.flush()
+        source = SourceEvent(channel_id=channel.id, source_id="123456",
+                             revision="r1", snapshot={"id": "123456",
+                         "text": "Processing event", "grouped_id": "",
+                         "media_id": "", "date": "", "edited": "",
+                         "entities": []})
+        s.add(source)
+        s.flush()
+        channel_id, event_id = channel.id, source.id
+
+    with session_scope() as s:
+        message = MonitorMessage(channel_id=channel_id, tg_message_id="123456",
+                                 text_raw="Processing event", text_zh="Processing event",
+                                 theme="generic", translate_status="skipped")
+        s.add(message)
+        s.flush()
+        message_id = message.id
+
+    async def fake_ingest(*args, **kwargs):
+        return message_id
+
+    monkeypatch.setattr(processing.pipeline, "ingest", fake_ingest)
+    runner = SimpleNamespace(client=object(), status="online")
+    await processing.ingest(runner, {"event_id": event_id})
+
+    with session_scope() as s:
+        assert s.get(SourceEvent, event_id).message_id == message_id
+        job = s.query(ProcessingJob).filter_by(queue="publish").one()
+        assert job.payload == {"message_id": message_id}
+
+
 def test_correction_keeps_evidence_and_scoped_history():
     with activate({"app_id": "platform-test"}, "room", "person", "source-1"):
         member_profile.add_fact("person", "我喜欢红色")

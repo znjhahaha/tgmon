@@ -40,7 +40,7 @@ async def ingest(runner, payload):
             anchor = (anchor.filter_by(grouped_id=event.grouped_id) if event.grouped_id
                       else anchor.filter_by(tg_message_id=event.source_id)).first()
             mid = anchor.id if anchor else None
-    if mid:
+        if mid:
             s.query(SourceEvent).filter(SourceEvent.id.in_(event_ids)).update(
                 {"message_id": mid}, synchronize_session=False)
             # One publication job per content event. The output queues have
