@@ -121,7 +121,8 @@ def test_op13_callback_endpoint(db, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(settings, "get", lambda key, default=None:
-                        OFFICIAL_SECRET if key == "QQ_APP_SECRET" else default)
+                        {"QQ_APP_SECRET": OFFICIAL_SECRET,
+                         "QQ_APP_ID": "1020000000"}.get(key, default))
     body = _json.dumps({
         "op": 13,
         "d": {"plain_token": OFFICIAL_V_TOKEN, "event_ts": OFFICIAL_V_TS},
@@ -161,6 +162,8 @@ def test_op13_uses_bot_secret(db, monkeypatch):
             return OFFICIAL_SECRET
         if key == "QQ_SIGN_SECRET":
             return stale_token  # 模拟 DB 残值
+        if key == "QQ_APP_ID":
+            return "1020000000"
         return default
 
     monkeypatch.setattr(settings, "get", fake_get)
@@ -188,7 +191,8 @@ def test_op13_without_signature_headers(db, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(settings, "get", lambda key, default=None:
-                        OFFICIAL_SECRET if key == "QQ_APP_SECRET" else default)
+                        {"QQ_APP_SECRET": OFFICIAL_SECRET,
+                         "QQ_APP_ID": "1020000000"}.get(key, default))
     body = _json.dumps({
         "op": 13,
         "d": {"plain_token": OFFICIAL_V_TOKEN, "event_ts": OFFICIAL_V_TS},
@@ -214,7 +218,8 @@ def test_op0_without_signature_rejected(db, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(settings, "get", lambda key, default=None:
-                        OFFICIAL_SECRET if key == "QQ_APP_SECRET" else default)
+                        {"QQ_APP_SECRET": OFFICIAL_SECRET,
+                         "QQ_APP_ID": "1020000000"}.get(key, default))
     body = _json.dumps({"op": 0, "t": "GROUP_ADD_ROBOT",
                         "d": {"group_openid": "ABC1234567890"}}).encode()
     client = TestClient(_admin_app())
@@ -229,7 +234,8 @@ def test_op0_bad_signature_rejected(db, monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(settings, "get", lambda key, default=None:
-                        OFFICIAL_SECRET if key == "QQ_APP_SECRET" else default)
+                        {"QQ_APP_SECRET": OFFICIAL_SECRET,
+                         "QQ_APP_ID": "1020000000"}.get(key, default))
     body = _json.dumps({"op": 0, "t": "GROUP_ADD_ROBOT",
                         "d": {"group_openid": "ABC1234567890"}}).encode()
     client = TestClient(_admin_app())
@@ -315,15 +321,28 @@ def db():
         from tgmon.models import QqEvent, QqPending, ShareToken, ConversationTurn, Conversation
         for t in (QqEvent, QqPending, ShareToken, ConversationTurn, Conversation, QqInbound, QqDelivery, QqGroup, MonitorMessage, Channel):
             s.query(t).delete()
+        from tgmon.models import QqBot
+        s.query(QqBot).delete()
         from tgmon.models import AppSetting
         for r in s.query(AppSetting).all():
             s.delete(r)
     settings.invalidate()
+    qq_client.invalidate_token()
 
 
 @pytest.fixture()
 def conf(db, monkeypatch):
-    """打开 QQ 推送并给基础数据。返回可调的 settings 快捷方式。"""
+    """打开 QQ 推送并给基础数据。返回可调的 settings 快捷方式。
+
+    多机器人时代：预置一个启用的机器人行（推送 / 测试消息路径都要
+    解析凭据）。想测「无机器人」的场景直接用 db fixture。
+    """
+    from tgmon.crypto import encrypt
+    from tgmon.models import QqBot
+    with session_scope() as s:
+        if not s.query(QqBot.id).first():
+            s.add(QqBot(app_id="10001", nickname="测试机器人",
+                        app_secret_enc=encrypt("secret-10001")))
     settings.set_many({"QQ_ENABLED": True, "QQ_CHANNEL_IDS": [],
                        "QQ_INCLUDE_DUPS": False, "QQ_DAILY_LIMIT": 950})
     from tgmon.qqbot import media
@@ -356,7 +375,7 @@ def fake_send(monkeypatch):
     """记录调用而不真发网络请求。默认成功。"""
     SENT.clear()
 
-    async def _fake(openid, content, msg_id=None):
+    async def _fake(openid, content, msg_id=None, bot=None):
         SENT.append((openid, content))
         return "ROBOT1.0_fake"
 
@@ -587,7 +606,7 @@ async def test_agent_explicit_count_preserved(db, monkeypatch):
         ok = True
         text = '{"action":"latest","args":{"n":2},"reply":""}'
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         return _R()
 
     monkeypatch.setattr(registry, "complete_with_failover", _fake)
@@ -750,7 +769,7 @@ async def test_agent_routes_chat(db, monkeypatch):
         text = ('{"action":"chat","args":{},"reply":'
                 '"我是群助手，负责搬运游戏爆料～"}')
 
-    async def _fake_complete(system, user):
+    async def _fake_complete(system, user, **kw):
         return _FakeRes()
 
     from tgmon.providers import registry
@@ -768,7 +787,7 @@ async def test_agent_routes_to_latest(db, monkeypatch):
         ok = True
         text = '{"action":"latest","args":{"n":1},"reply":""}'
 
-    async def _fake_complete(system, user):
+    async def _fake_complete(system, user, **kw):
         return _FakeRes()
 
     from tgmon.providers import registry
@@ -787,7 +806,7 @@ async def test_agent_rejects_unknown_action(db, monkeypatch):
         ok = True
         text = '{"action":"delete_all","args":{},"reply":"已删除"}'
 
-    async def _fake_complete(system, user):
+    async def _fake_complete(system, user, **kw):
         return _FakeRes()
 
     from tgmon.providers import registry
@@ -928,7 +947,7 @@ async def test_push_daily_limit(db, conf, fake_send, fake_payload):
 async def test_push_not_in_group_disables(db, conf, monkeypatch, fake_payload):
     """40034101（不在群）→ 群自动停用，投递标失败。"""
 
-    async def _fail(openid, content, msg_id=None):
+    async def _fail(openid, content, msg_id=None, bot=None):
         raise qq_client.QqApiError(40034101, "机器人非群成员")
 
     monkeypatch.setattr(qq_client, "send_group_text", _fail)
@@ -946,7 +965,7 @@ async def test_push_not_in_group_disables(db, conf, monkeypatch, fake_payload):
 async def test_push_rate_limit_goes_retry(db, conf, monkeypatch, fake_payload):
     """40034100（频控）→ 进重试队列而不是失败。"""
 
-    async def _fail(openid, content, msg_id=None):
+    async def _fail(openid, content, msg_id=None, bot=None):
         raise qq_client.QqApiError(40034100, "主动消息发送超过频控限制")
 
     monkeypatch.setattr(qq_client, "send_group_text", _fail)
@@ -964,7 +983,7 @@ async def test_push_no_permission_fatal_no_retry(db, conf, monkeypatch,
     """40034105（主动消息无权限，个人主体常见）→ 直接 failed 不重试，
     且不停用群 —— 群内被动回复（命令/AI）依然可用。"""
 
-    async def _fail(openid, content, msg_id=None):
+    async def _fail(openid, content, msg_id=None, bot=None):
         raise qq_client.QqApiError(40034105, "主动消息失败, 无权限")
 
     monkeypatch.setattr(qq_client, "send_group_text", _fail)
@@ -1012,16 +1031,16 @@ def fake_media(monkeypatch):
     UPLOADS: list[str] = []
     MEDIA_SENT: list[tuple[str, str]] = []
 
-    async def _fake_upload(openid, thumb, raise_fatal=False):
+    async def _fake_upload(openid, thumb, raise_fatal=False, bot=None):
         UPLOADS.append(thumb)
         return f"fi:{thumb}"
 
-    async def _fake_album(openid, thumbs, raise_fatal=False):
+    async def _fake_album(openid, thumbs, raise_fatal=False, bot=None):
         UPLOADS.extend(thumbs)
         return "fi:whole-album"
 
     async def _fake_send_media(openid, file_info, msg_id=None,
-                               msg_seq=None, content=None):
+                               msg_seq=None, content=None, bot=None):
         MEDIA_SENT.append((openid, file_info))
         return "ROBOT1.0_fake_media"
 
@@ -1087,7 +1106,7 @@ async def test_push_image_only_all_failed_goes_retry(db, conf, fake_send,
     import tgmon.qqbot.media as qq_media
     from tgmon import outputs
 
-    async def _no_upload(openid, thumb, raise_fatal=False):
+    async def _no_upload(openid, thumb, raise_fatal=False, bot=None):
         return None
 
     monkeypatch.setattr(qq_media, "upload_image", _no_upload)
@@ -1109,7 +1128,7 @@ async def test_push_image_only_not_in_group_disables(db, conf, fake_send,
     import tgmon.qqbot.media as qq_media
     from tgmon import outputs
 
-    async def _fail_upload(openid, thumb, raise_fatal=False):
+    async def _fail_upload(openid, thumb, raise_fatal=False, bot=None):
         raise qq_client.QqApiError(40034101, "机器人非群成员")
 
     monkeypatch.setattr(qq_media, "upload_image", _fail_upload)
@@ -1138,19 +1157,32 @@ async def test_push_no_text_no_photos_falls_back_to_head(db, conf, fake_send,
 
 
 @pytest.mark.asyncio
-async def test_cmd_latest_image_only_no_placeholder(db):
-    """群内卡片：纯图爆料只有标题行 + 图片回复，无「（无文本）」。"""
+async def test_cmd_latest_image_only_no_placeholder(db, monkeypatch):
+    """群内卡片：纯图爆料只有标题行 + 链接回复，无「（无文本）」。"""
+    import asyncio as _asyncio
+
+    from tgmon.qqbot import commands as commands_mod, sending
+
+    async def _no_send(*a, **kw):
+        return {}
+
+    monkeypatch.setattr(sending, "send_parts", _no_send)
     mid = _seed_message(text_zh=None, text_raw="")
     _seed_photos(mid, n=1)
     res = await qqbot.handle_callback_event(_at_event("/latest 1"))
     t = _texts(res)
     assert "无文本" not in t
     assert "【原神】" in t
-    assert any(r.kind == "image" for r in res["replies"])
+    # 2026-09 超时复盘后：守卫内只回链接，长图后台补发
+    assert len(res["replies"]) == 1 and res["replies"][0].kind == "text"
+    assert "/s/" in res["replies"][0].text
+    # 后台渲染任务收尾（send_parts 已 mock，不真发图）
+    while commands_mod._BG_TASKS:
+        await _asyncio.wait(set(commands_mod._BG_TASKS), timeout=10)
 
 
 @pytest.mark.asyncio
-async def test_test_message_bypasses_switch(db, fake_send):
+async def test_test_message_bypasses_switch(db, conf, fake_send):
     """开关关闭也能发测试（否则没法验证新配置）。"""
     settings.set_many({"QQ_ENABLED": False})
     _seed_group(openid="GTEST")

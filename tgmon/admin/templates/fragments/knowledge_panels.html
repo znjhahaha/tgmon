@@ -112,7 +112,7 @@
 </style>
 <div class="card" style="margin-top:0">
   <div class="kb-sec"><h2>成员档案</h2>
-    <span class="dim">{{ member_profiles | length }} 位成员 · 昵称与个人事实直接落库（记忆 v2）</span></div>
+    <span class="dim">{{ member_profiles | length }} 份档案</span></div>
   {% if member_profiles %}
   <div class="table-scroll"><table>
     <thead><tr><th>称呼</th><th>个人事实</th><th>最近更新</th></tr></thead>
@@ -120,14 +120,17 @@
     {% for p in member_profiles %}
     <tr>
       <td><b>{{ p.nickname or '（未设置）' }}</b>
-        <div class="dim" style="font-size:11px">{{ p.member_openid[:10] }}…</div></td>
+        <div class="dim" style="font-size:11px">{{ p.member_openid[:10] }}…</div>
+        <div>{{ '归属待确认' if p.confirmation != 'confirmed' else '已确认' }}</div>
+        {% if p.scope_data %}<div class="dim" style="overflow-wrap:anywhere">{{ p.scope_data.get('bot', '') }} / {{ p.scope_data.get('group') or '私聊' }}</div>{% endif %}</td>
       <td>{% set ns = namespace(has=false) %}
         {% for k, v in (p.facts or {}).items() %}
           {% if v is mapping %}{% set t = v.get('text') or '' %}{% else %}{% set t = v %}{% endif %}
           {% if t %}<span class="tag">{{ t }}</span>{% set ns.has = true %}{% endif %}
         {% endfor %}
         {% if not ns.has %}<span class="dim">—</span>{% endif %}</td>
-      <td class="dim" style="white-space:nowrap">{{ p.updated_at | ago }}</td>
+      <td class="dim" style="white-space:nowrap">{{ p.updated_at | ago }}
+        <form method="post" action="/kb/profile/{{ p.id }}/forget"><input name="query" aria-label="遗忘内容"><button class="btn sm ghost">遗忘</button></form></td>
     </tr>
     {% endfor %}
     </tbody>

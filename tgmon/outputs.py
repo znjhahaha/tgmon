@@ -35,16 +35,25 @@ def media_url(rel: str | None) -> str | None:
 
 
 def serialize(message_id: int, include_original: bool = True) -> dict | None:
+    rows = serialize_many([message_id], include_original=include_original)
+    return rows[0] if rows else None
+
+
+def serialize_many(ids: list[int], include_original: bool = True) -> list[dict]:
+    from .message_query import project_many
     with session_scope() as s:
-        m = s.get(MonitorMessage, message_id)
-        if m is None:
-            return None
-        ch = s.get(Channel, m.channel_id)
-        media = (s.query(MessageMedia)
-                 .filter(MessageMedia.message_id == m.id)
-                 .order_by(MessageMedia.id.asc()).all())
+        by_id = {m.id: m for m in s.query(MonitorMessage).filter(MonitorMessage.id.in_(ids))}
+        rows = [by_id[mid] for mid in ids if mid in by_id]
+        views = project_many(s, rows)
+        channels = {ch.id: ch for ch in s.query(Channel).filter(Channel.id.in_({m.channel_id for m in rows}))}
+        return [_serialize(m, channels.get(m.channel_id), view, include_original)
+                for m, view in zip(rows, views)]
+
+
+def _serialize(m, ch, view, include_original):
         out = {
             "id": m.id,
+            "theme": m.theme,
             "channel": {
                 "id": ch.id if ch else None,
                 "title": ch.title if ch else "",
@@ -71,18 +80,14 @@ def serialize(message_id: int, include_original: bool = True) -> dict | None:
             "spoiler_ranges": m.spoiler_ranges or [],
             "duplicate_of": m.duplicate_of,
             "dup_reason": m.dup_reason,
-            "has_media": m.has_media,
+            "has_media": view["has_media"],
             "media": [
                 {
-                    "kind": x.kind,
-                    "thumb": media_url(x.thumb_path),
-                    "width": x.width,
-                    "height": x.height,
-                    "duration": x.duration,
-                    "orig_bytes": x.orig_bytes,
-                    "mime": x.mime,
+                    **{key: x.get(key) for key in ("kind", "status", "error", "sha256",
+                        "video_status", "source_tg_id", "width", "height", "duration", "orig_bytes", "mime")},
+                    "thumb": media_url(x["thumb"]),
                 }
-                for x in media
+                for x in view["media"]
             ],
         }
         if include_original:

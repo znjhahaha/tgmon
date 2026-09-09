@@ -109,7 +109,7 @@
           <a href="/media/private/{{ x.video_path }}" target="_blank"
              rel="noreferrer">播放（{{ x.video_bytes|human_bytes }}）</a>
         {% elif x.video_status %}
-          <span class="dim">{{ x.video_status }}</span>
+          <span class="dim">{{ x.error or x.video_status }}</span>
         {% else %}—{% endif %}
       </td>
       <td><code>{{ x.phash or '—' }}</code></td>

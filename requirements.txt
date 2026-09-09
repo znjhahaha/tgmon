@@ -8,7 +8,7 @@ uvicorn==0.34.0
 Jinja2==3.1.5
 python-multipart==0.0.20
 itsdangerous==2.2.0
-pydantic==2.10.6
+pydantic>=2.11,<3
 
 # ---- DB ----
 SQLAlchemy==2.0.37
@@ -17,6 +17,8 @@ SQLAlchemy==2.0.37
 openai==1.63.2
 anthropic==0.46.0
 httpx==0.28.1
+mcp>=1.28,<2
+filelock>=3.16,<4
 
 # ---- Media / dedup ----
 Pillow==11.1.0

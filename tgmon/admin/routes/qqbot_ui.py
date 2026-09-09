@@ -15,9 +15,9 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
 from ... import outputs, settings
-from ...crypto import mask
+from ...crypto import encrypt, mask
 from ...db import session_scope
-from ...models import Channel, QqDelivery, QqGroup, QqInbound, Conversation
+from ...models import Channel, QqBot, QqBotCapability, QqDelivery, QqGroup, QqInbound, Conversation
 from ...util import log_event
 from ..deps import redirect, render, require_admin
 from ... import qqbot
@@ -51,8 +51,54 @@ def _bridge_state() -> tuple[bool, str]:
     return False, f"{int(delta / 86400)} 天前"
 
 
+def _bot_secret(row) -> str:
+    """解密机器人密钥（页面脱敏展示用）。"""
+    from ...crypto import decrypt
+    if not row.app_secret_enc:
+        return ""
+    try:
+        return decrypt(row.app_secret_enc)
+    except Exception:
+        return ""
+
+
+def _bot_bridge_state(row) -> tuple[bool, str]:
+    """单个机器人的桥心跳状态（每 bot 一个桥容器，各自上报）。"""
+    seen = row.bridge_last_seen
+    if seen is None:
+        return False, "从未"
+    delta = (datetime.utcnow() - seen).total_seconds()
+    if delta < 0:
+        return True, "刚刚"
+    if delta < 180:
+        return True, f"{int(delta)} 秒前"
+    if delta < 3600:
+        return False, f"{int(delta / 60)} 分钟前"
+    if delta < 86400:
+        return False, f"{int(delta / 3600)} 小时前"
+    return False, f"{int(delta / 86400)} 天前"
+
+
 def _ctx() -> dict:
     with session_scope() as s:
+        bots = []
+        capabilities = {c.bot_id: c for c in s.query(QqBotCapability)}
+        for b in s.query(QqBot).order_by(QqBot.id.asc()).all():
+            n_groups = (s.query(QqGroup)
+                        .filter(QqGroup.bot_id == b.id,
+                                QqGroup.enabled.is_(True)).count())
+            online, seen = _bot_bridge_state(b)
+            bots.append({
+                "id": b.id, "nickname": b.nickname or b.app_id,
+                "app_id": b.app_id, "enabled": b.enabled,
+                "bridge_online": online, "bridge_seen": seen,
+                "n_groups": n_groups,
+                "secret_mask": mask(_bot_secret(b) or ""),
+                "added_at": b.added_at,
+                "proactive": capabilities[b.id].proactive_enabled if b.id in capabilities else True,
+                "proactive_error": capabilities[b.id].proactive_error if b.id in capabilities else "",
+            })
+        bot_names = {b.id: (b.nickname or b.app_id) for b in s.query(QqBot).all()}
         groups = []
         for g in s.query(QqGroup).order_by(QqGroup.id.asc()).all():
             pend = (s.query(QqDelivery)
@@ -67,6 +113,7 @@ def _ctx() -> dict:
                 "sent_today": g.sent_today, "sent_date": g.sent_date,
                 "last_sent_at": g.last_sent_at, "added_at": g.added_at,
                 "pending": pend, "failed": fail,
+                "bot": bot_names.get(g.bot_id, "") if g.bot_id else "",
             })
         recent = []
         for d in (s.query(QqDelivery)
@@ -105,8 +152,9 @@ def _ctx() -> dict:
     bridge_online, bridge_seen = _bridge_state()
     return {
         "qq_enabled": settings.get("QQ_ENABLED"),
-        "app_id": str(settings.get("QQ_APP_ID") or ""),
-        "secret_mask": mask(settings.get("QQ_APP_SECRET") or ""),
+        "bots": bots,
+        "legacy_creds": bool(str(settings.get("QQ_APP_ID") or "").strip()
+                             and str(settings.get("QQ_APP_SECRET") or "").strip()),
         "channel_ids": [int(x) for x in chan_ids],
         "include_dups": settings.get("QQ_INCLUDE_DUPS"),
         "daily_limit": settings.get("QQ_DAILY_LIMIT"),
@@ -120,7 +168,6 @@ def _ctx() -> dict:
         "agent_system": str(settings.get("QQ_AGENT_SYSTEM") or ""),
         "ai_fallback": settings.get("QQ_AI_FALLBACK"),
         "ai_agent": settings.get("QQ_AI_AGENT_ENABLED"),
-        "daily_digest": settings.get("QQ_DAILY_DIGEST_ENABLED"),
         "relay_repo": str(settings.get("GITHUB_RELAY_REPO") or ""),
         "relay_token_mask": mask(settings.get("GITHUB_RELAY_TOKEN") or ""),
         "inbound": inbound,
@@ -148,44 +195,142 @@ async def page(request: Request, user: str = Depends(require_admin)):
 
 @router.post("/config")
 async def save_config(request: Request,
-                      app_id: str = Form(""),
-                      app_secret: str = Form(""),
-                      daily_limit: int = Form(950),
+                      daily_limit: int = Form(0),
                       qq_enabled: str = Form(""),
                       include_dups: str = Form(""),
                       user: str = Depends(require_admin)):
+    """推送全局设置（机器人凭据在「机器人」卡片单独管理）。"""
     form = await request.form()
     chan_ids = _ints(form.getlist("channel_ids"))
     settings.set_many({
-        "QQ_APP_ID": app_id.strip(),
-        # is_secret 字段空值 = 保留原值（settings.set_many 的表单语义）
-        "QQ_APP_SECRET": app_secret.strip(),
         "QQ_ENABLED": qq_enabled.strip().lower() in ("on", "1"),
         "QQ_INCLUDE_DUPS": include_dups.strip().lower() in ("on", "1"),
         "QQ_CHANNEL_IDS": chan_ids,
-        "QQ_DAILY_LIMIT": max(1, min(daily_limit, 1000)),
+        "QQ_DAILY_LIMIT": max(0, min(daily_limit, 1000000)),
     })
-    # 凭证可能变了，token 缓存立即失效（admin 进程这边的）
+    return HTMLResponse("<div class='flash ok'>推送设置已保存。</div>")
+
+
+# ---------------- 机器人（多实例）管理 ----------------
+
+_APPID_RE = re.compile(r"^[0-9A-Za-z_-]{4,40}$")
+
+
+@router.post("/bots/add")
+async def bot_add(request: Request,
+                  nickname: str = Form(""),
+                  app_id: str = Form(""),
+                  app_secret: str = Form(""),
+                  user: str = Depends(require_admin)):
+    """新增机器人。凭据存 qq_bot 表（密钥加密），token/验签按行隔离。"""
+    app_id = app_id.strip()
+    secret = app_secret.strip()
+    nickname = nickname.strip()
+    if not _APPID_RE.match(app_id) or not secret:
+        return HTMLResponse("<div class='flash err'>AppID / AppSecret 必填"
+                            "（AppID 在 q.qq.com「开发设置」页，Secret 即"
+                            "「机器人密钥」）。</div>")
+    with session_scope() as s:
+        if s.query(QqBot).filter(QqBot.app_id == app_id).first():
+            return HTMLResponse(f"<div class='flash err'>AppID {app_id}"
+                                " 已存在。</div>")
+        s.add(QqBot(app_id=app_id, nickname=nickname,
+                    app_secret_enc=encrypt(secret)))
+    log_event("info", "qqbot", f"新增机器人 {nickname or app_id}（app_id={app_id}）")
+    from ...qqbot import client as qq_client
+    qq_client.invalidate_token()
+    return redirect("/qqbot")
+
+
+@router.post("/bots/{bid}/update")
+async def bot_update(bid: int, request: Request,
+                     nickname: str = Form(""),
+                     app_secret: str = Form(""),
+                     user: str = Depends(require_admin)):
+    """改名称 / 换密钥（留空 = 不改）。换密钥后建议立即自检。"""
+    with session_scope() as s:
+        b = s.get(QqBot, bid)
+        if b is None:
+            return HTMLResponse("<div class='flash err'>机器人不存在</div>")
+        b.nickname = nickname.strip()
+        if app_secret.strip():
+            b.app_secret_enc = encrypt(app_secret.strip())
     from ...qqbot import client as qq_client
     qq_client.invalidate_token()
     return HTMLResponse("<div class='flash ok'>已保存。换过 AppSecret 的话"
-                        "先点一次「自检密钥与回调」确认密钥有效。</div>")
+                        "点一次「自检」确认密钥有效。</div>")
 
 
-@router.post("/selfcheck")
-async def selfcheck(request: Request, user: str = Depends(require_admin)):
-    """密钥自检：用当前 AppSecret 换一次 access_token。
+@router.post("/bots/{bid}/toggle")
+async def bot_toggle(bid: int, request: Request,
+                     user: str = Depends(require_admin)):
+    """启停机器人。停用 = 该机器人的群全部停止推送（群行保留）。"""
+    with session_scope() as s:
+        b = s.get(QqBot, bid)
+        if b is None:
+            return HTMLResponse("<span class='err'>不存在</span>")
+        b.enabled = not b.enabled
+        state = b.enabled
+    label = "启用中" if state else "已停用"
+    cls = "on" if state else "off"
+    return HTMLResponse(
+        f"<button class='pill {cls}' "
+        f"hx-post='/qqbot/bots/{bid}/toggle' hx-swap='outerHTML'>{label}</button>")
+
+
+@router.post("/bots/{bid}/delete")
+async def bot_delete(bid: int, request: Request,
+                     user: str = Depends(require_admin)):
+    """删除机器人。其群的归属清空并停用（无法再用已删凭据推送）。"""
+    with session_scope() as s:
+        b = s.get(QqBot, bid)
+        if b is not None:
+            (s.query(QqGroup).filter(QqGroup.bot_id == bid)
+             .update({"bot_id": None, "enabled": False}, synchronize_session=False))
+            s.delete(b)
+    from ...qqbot import client as qq_client
+    qq_client.invalidate_token()
+    log_event("info", "qqbot", f"删除机器人 #{bid}，其群已停用")
+    return redirect("/qqbot")
+
+
+@router.post("/bots/{bid}/proactive")
+async def bot_proactive(bid: int, request: Request, enabled: str = Form(""),
+                         user: str = Depends(require_admin)):
+    with session_scope() as s:
+        if s.get(QqBot, bid) is None:
+            return redirect("/qqbot")
+        row = s.get(QqBotCapability, bid)
+        if row is None:
+            row = QqBotCapability(bot_id=bid)
+            s.add(row)
+        row.proactive_enabled = enabled == "on"
+        row.proactive_error = None
+        if row.proactive_enabled:
+            targets = s.query(QqGroup.group_openid).filter_by(bot_id=bid)
+            s.query(QqDelivery).filter(QqDelivery.group_openid.in_(targets),
+                QqDelivery.status == "blocked").update({"status": "pending"}, synchronize_session=False)
+    return redirect("/qqbot")
+
+
+@router.post("/bots/{bid}/selfcheck")
+async def bot_selfcheck(bid: int, request: Request,
+                        user: str = Depends(require_admin)):
+    """按机器人自检：用它的 AppSecret 换一次 access_token。
 
     密钥不变量：能换到 access_token 的那个才是签名密钥 —— 回调验签与
-    getAppAccessToken 共用 bot_secret()（官方 sign.html 的 Bot Secret =
+    getAppAccessToken 共用 AppSecret（官方 sign.html 的 Bot Secret =
     clientSecret）。换 token 失败（如 100016 invalid）说明填的是
     「机器人令牌」或别的错值，此时 op13 握手必然 13007。
     """
     from ...qqbot import client as qq_client
-    app_id, secret = qq_client._credentials()
+    try:
+        bot = qq_client.resolve_bot(bot_id=bid)
+    except qq_client.QqApiError as e:
+        return HTMLResponse(f"<div class='flash err'>{e.message}</div>")
+    app_id, secret = bot["app_id"], bot["app_secret"]
     if not app_id or not secret:
-        return HTMLResponse("<div class='flash err'>AppID / AppSecret 未配置，"
-                            "先在上面填好保存。</div>")
+        return HTMLResponse("<div class='flash err'>AppID / AppSecret 未配置。</div>")
     try:
         await qq_client._fetch_token(app_id, secret)
     except qq_client.QqApiError as e:
@@ -206,16 +351,24 @@ async def selfcheck(request: Request, user: str = Depends(require_admin)):
 @router.post("/groups/create")
 async def group_create(request: Request, openid: str = Form(""),
                        nickname: str = Form(""),
+                       bot_id: str = Form(""),
                        user: str = Depends(require_admin)):
     openid = openid.strip()
     if not _OPENID_RE.match(openid):
         return HTMLResponse("<div class='flash err'>openid 格式不对。正确值"
                             "在机器人进群后自动出现；手动填一般是进群回调"
                             "丢了才需要。</div>")
+    try:
+        owner = int(bot_id) if str(bot_id).strip().isdigit() else None
+    except ValueError:
+        owner = None
     with session_scope() as s:
         if s.query(QqGroup).filter(QqGroup.group_openid == openid).first():
             return HTMLResponse("<div class='flash err'>这个 openid 已存在</div>")
-        s.add(QqGroup(group_openid=openid, nickname=nickname.strip()))
+        if owner is not None and s.get(QqBot, owner) is None:
+            return HTMLResponse("<div class='flash err'>所选机器人不存在</div>")
+        s.add(QqGroup(group_openid=openid, nickname=nickname.strip(),
+                      bot_id=owner))
     return redirect("/qqbot")
 
 
@@ -288,18 +441,14 @@ async def save_ai_config(request: Request,
     ai_enabled = str(form.get("ai_enabled", "")).lower() in ("on", "1")
     ai_fallback = str(form.get("ai_fallback", "")).lower() in ("on", "1")
     ai_agent = str(form.get("ai_agent", "")).lower() in ("on", "1")
-    daily_digest = str(form.get("daily_digest", "")).lower() in ("on", "1")
     settings.set_many({
         "QQ_AI_ENABLED": ai_enabled,
         "QQ_AI_FALLBACK": ai_fallback,
         "QQ_AI_AGENT_ENABLED": ai_agent,
-        "QQ_DAILY_DIGEST_ENABLED": daily_digest,
         "QQ_AI_SYSTEM": ai_system.strip(),
         "QQ_AGENT_SYSTEM": agent_system.strip(),
     })
-    return HTMLResponse("<div class='flash ok'>AI 设置已保存。"
-                        "每日召回摘要依赖平台 is_wakeup 通道（群聊支持性"
-                        "待实测，被拒会自动停用）。</div>")
+    return HTMLResponse("<div class='flash ok'>AI 设置已保存。</div>")
 
 
 @router.post("/memory/clear")
@@ -355,14 +504,19 @@ async def relay_test(request: Request, user: str = Depends(require_admin)):
         if g is None or row is None:
             return HTMLResponse("<div class='flash err'>没有启用中的群或"
                                 "库里没有图片消息，无法测试。</div>")
-        openid, thumb = g.group_openid, row.thumb_path
+        openid, thumb, owner = g.group_openid, row.thumb_path, g.bot_id
+    from ...qqbot import client as qq_client
+    try:
+        bot = qq_client.resolve_bot(bot_id=owner) if owner else qq_client.resolve_bot()
+    except qq_client.QqApiError as e:
+        return HTMLResponse(f"<div class='flash err'>机器人不可用: {e.message}</div>")
     url = await qq_media.github_relay_url(thumb)
     if not url:
         return HTMLResponse("<div class='flash err'>上传 GitHub 失败——检查"
                             " Token 权限（需要该仓库 Contents 读写）与"
                             " 分支是否为 main。</div>")
     try:
-        fi = await qq_media.client.upload_group_file(openid, 1, url)
+        fi = await qq_media.client.upload_group_file(openid, 1, url, bot=bot)
     except Exception as e:
         return HTMLResponse(f"<div class='flash err'>GitHub 上传成功但平台"
                             f"拉取失败：{e}</div>")

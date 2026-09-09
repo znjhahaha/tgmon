@@ -23,6 +23,13 @@
     botpy 容器常驻在线也是<b>主动推送的前提</b>——平台要求发主动消息时机器人
     保持 WS 网关在线。桥离线时推送 API 调用可能被平台拒绝。
   </p>
+  <p class="hint" style="margin:4px 0">
+    <b>多机器人部署</b>：每个机器人各起一个 botpy 桥容器（镜像与脚本同
+    <code>scripts/botpy_official.py</code>，APPID / SECRET 各填各的，
+    BRIDGE_TOKEN 共用）。新版脚本会在事件里带上自己的 AppID，
+    服务端据此路由；旧版脚本只支持单机器人。Webhook 回调则多个机器人
+    共用同一个 <code>/qqbot/callback</code> 地址，按请求头自动区分。
+  </p>
   <p style="margin:8px 0 0">
     桥令牌：
     {% if bridge_token_set %}<span class="tag ok">已配置</span>
@@ -41,7 +48,6 @@
       <label><input type="checkbox" name="ai_enabled" {{ 'checked' if ai_enabled }}>启用 AI 对话</label>
       <label><input type="checkbox" name="ai_fallback" {{ 'checked' if ai_fallback }}>非命令 @ 消息走 AI（关闭则仅 /ai 触发）</label>
       <label><input type="checkbox" name="ai_agent" {{ 'checked' if ai_agent }}>AI 意图路由（说人话自动选命令，关闭则纯聊天）</label>
-      <label><input type="checkbox" name="daily_digest" {{ 'checked' if daily_digest }}>每日 21:00 召回摘要（当天互动过的群收当日汇总）</label>
     </div>
     <label>AI 人设（系统提示词，留空 = 默认助手人格）
       <textarea name="ai_system" rows="3" style="width:100%;box-sizing:border-box"
@@ -118,15 +124,86 @@
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">接入凭证</h2>
+  <h2 style="margin-top:0">机器人</h2>
+  <p class="sub">支持多个机器人同时接入：每个机器人独立凭据、独立 token 与推送配额，
+    群按「拉它进群的机器人」归属。同一物理群拉两个机器人 = 每个机器人各自
+    推送一遍（openid 不同，数据不冲突），按需取舍。</p>
+  {% if bots %}
+  <table>
+    <tr><th>名称</th><th>AppID</th><th>状态</th><th>桥在线</th><th>启用群</th><th>操作</th></tr>
+    {% for b in bots %}
+      <tr><td colspan="6">
+        <form method="post" action="/qqbot/bots/{{ b.id }}/proactive" class="inline">
+          <label><input type="checkbox" name="enabled" {{ 'checked' if b.proactive }}> {{ b.nickname }} 自动推送</label>
+          <button class="btn sm">保存</button>
+        </form>
+        {% if b.proactive_error %}<p class="err">{{ b.proactive_error }}</p>{% endif %}
+      </td></tr>
+    <tr>
+      <td>
+        <form hx-post="/qqbot/bots/{{ b.id }}/update" hx-target="#qb-{{ b.id }}-res"
+              hx-swap="innerHTML" class="inline" style="gap:4px">
+          <input name="nickname" value="{{ b.nickname }}" style="width:110px">
+          <input name="app_secret" type="password" style="width:110px"
+                 placeholder="{{ b.secret_mask or '换密钥（留空不改）' }}"
+                 autocomplete="new-password">
+          <button class="btn sm ghost">存</button>
+        </form>
+        <div id="qb-{{ b.id }}-res" style="font-size:11px"></div>
+      </td>
+      <td><code style="font-size:12px">{{ b.app_id }}</code></td>
+      <td>
+        <button class="pill {{ 'on' if b.enabled else 'off' }}"
+                hx-post="/qqbot/bots/{{ b.id }}/toggle" hx-swap="outerHTML">
+          {{ '启用中' if b.enabled else '已停用' }}</button>
+      </td>
+      <td>
+        {% if b.bridge_online %}<span class="tag ok">{{ b.bridge_seen }}</span>
+        {% else %}<span class="tag err">{{ b.bridge_seen }}</span>{% endif %}
+      </td>
+      <td>{{ b.n_groups }}</td>
+      <td class="row">
+        <button class="btn sm ghost" hx-post="/qqbot/bots/{{ b.id }}/selfcheck"
+                hx-target="#qb-{{ b.id }}-chk" hx-swap="innerHTML">自检</button>
+        <form method="post" action="/qqbot/bots/{{ b.id }}/delete"
+              onsubmit="return confirm('删除这个机器人？它的群将停止推送')">
+          <button class="btn sm danger">删</button></form>
+      </td>
+    </tr>
+    <tr>
+      <td colspan="6" id="qb-{{ b.id }}-chk" class="dim"
+          style="padding:0 8px 4px;font-size:12px"></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">还没有机器人。下方添加，或——如果旧配置里已有
+    QQ_APP_ID / QQ_APP_SECRET——服务启动时会自动导入为首个机器人。</p>
+  {% endif %}
+  {% if legacy_creds and not bots %}
+  <p class="hint">检测到旧配置凭据（QQ_APP_ID / QQ_APP_SECRET），重启服务后
+    自动迁移为机器人表首行。</p>
+  {% endif %}
+  <details style="margin-top:8px" {{ 'open' if not bots }}>
+    <summary>添加机器人</summary>
+    <form hx-post="/qqbot/bots/add" hx-target="#qb-add-res" hx-swap="innerHTML"
+          class="inline" style="margin-top:6px">
+      <label>名称（群列表显示用）<input name="nickname" placeholder="小助手"></label>
+      <label>AppID<input name="app_id" required placeholder="102030405"></label>
+      <label>AppSecret<input name="app_secret" type="password" required
+             placeholder="管理端「机器人密钥」" autocomplete="new-password"></label>
+      <button class="btn sm">添加</button>
+    </form>
+    <div id="qb-add-res"></div>
+    <p class="hint">AppSecret 即管理端「开发设置」页的<b>机器人密钥</b>——API 鉴权、
+      WS 桥凭证、Webhook 回调验签共用同一个凭证。多机器人各需一个 botpy 桥容器
+      （见下方「多机器人部署」）。</p>
+  </details>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">推送设置</h2>
   <form hx-post="/qqbot/config" hx-target="#q-result" hx-swap="innerHTML">
-    <div class="inline">
-      <label>AppID<input name="app_id" value="{{ app_id }}" placeholder="102030405"></label>
-      <label>AppSecret（留空 = 不改）<input name="app_secret" type="password"
-             placeholder="{{ secret_mask or '未设置' }}" autocomplete="new-password"></label>
-    </div>
-    <p class="sub">AppSecret 即管理端「开发设置」页的<b>机器人密钥</b>——API 鉴权、
-      WS 桥凭证、Webhook 回调验签共用同一个凭证。</p>
     <fieldset>
       <legend>频道（都不勾 = 全部频道）</legend>
       <div class="chk scroll">
@@ -145,12 +222,6 @@
     <button class="btn">保存</button>
   </form>
   <div id="q-result"></div>
-  <p style="margin:8px 0 0">
-    <button class="btn" hx-post="/qqbot/selfcheck" hx-target="#q-selfcheck"
-            hx-swap="innerHTML">自检密钥</button>
-    <span class="sub">用当前 AppSecret 换一次 access_token：能换到 = 密钥正确。</span>
-  </p>
-  <div id="q-selfcheck"></div>
 </div>
 
 <div class="card">
@@ -164,16 +235,16 @@
     平台限制：<b>主动消息需平台审核开通权限</b>——个人主体机器人默认没有（报 40034105
     时推送/测试消息发不出，属平台限制而非配置错误）。此时群内交互不受影响：
     群友 @ 机器人用 <code>/latest</code> 等命令拉取内容（被动回复）。
-    已开通权限的机器人另受每群每天 1000 条、禁止链接限制（推送为纯文本摘要）。
+    是否可以主动推送、发送链接及实际频控，以当前机器人账户的 API 反馈为准。
   </p>
 </div>
 
 <div class="card">
   <h2 style="margin-top:0">群</h2>
-  <p class="sub">机器人被拉进群后自动出现（进群事件经 WS 桥到达）；被 @ 也会自动补录。</p>
+  <p class="sub">机器人被拉进群后自动出现（进群事件经 WS 桥到达，归属对应机器人）；被 @ 也会自动补录。</p>
   {% if groups %}
   <table>
-    <tr><th>群</th><th>openid</th><th>状态</th><th>今日已发</th><th>最后推送</th><th>投递</th><th></th></tr>
+    <tr><th>群</th><th>openid</th><th>机器人</th><th>状态</th><th>今日已发</th><th>最后推送</th><th>投递</th><th></th></tr>
     {% for g in groups %}
     <tr>
       <td>
@@ -186,6 +257,7 @@
         <div class="res" style="font-size:11px"></div>
       </td>
       <td><code style="font-size:11px">{{ g.openid[:14] }}…</code></td>
+      <td>{{ g.bot or '—' }}</td>
       <td>
         <button class="pill {{ 'on' if g.enabled else 'off' }}"
                 hx-post="/qqbot/groups/{{ g.id }}/toggle" hx-swap="outerHTML">
@@ -220,6 +292,11 @@
           class="inline">
       <label>group_openid<input name="openid" required placeholder="从「最近收到的消息」或日志里找"></label>
       <label>群名（可选）<input name="nickname"></label>
+      <label>归属机器人
+        <select name="bot_id">
+          <option value="">（自动 / 不指定）</option>
+          {% for b in bots %}<option value="{{ b.id }}">{{ b.nickname }}</option>{% endfor %}
+        </select></label>
       <button class="btn sm">添加</button>
     </form>
     <div id="qg-result"></div>

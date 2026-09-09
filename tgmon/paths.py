@@ -18,6 +18,7 @@ VIDEO_DIR = Path(os.getenv("TGMON_VIDEO") or MEDIA_DIR / "private")
 
 # user session 的文件名。worker 独占，admin 只检查存在性与删除
 USER_SESSION = SESSIONS_DIR / "user.session"
+EXTENSIONS_DIR = Path(os.getenv("TGMON_EXTENSIONS") or DB_PATH.parent / "extensions")
 
 
 def ensure_dirs() -> None:

@@ -61,7 +61,7 @@ def _load_feed(slug: str) -> dict | None:
 
 
 def _entries(feed: dict, entity: str = "") -> list[dict]:
-    from ...message_query import effective_game, project, query as message_query
+    from ...message_query import effective_game, project_many, query as message_query
     with session_scope() as s:
         games = [normalize_game(g) for g in feed["games"] if normalize_game(g)]
         chan_ids = list(feed["channel_ids"])
@@ -84,10 +84,10 @@ def _entries(feed: dict, entity: str = "") -> list[dict]:
             feed["max_items"] * 4 if entity else feed["max_items"]).all()
         names = {c.id: c.title for c in s.query(Channel).all()}
         out = []
-        for r in rows:
+        views = project_many(s, rows)
+        for r, item in zip(rows, views):
             if entity and entity not in entity_names(r.entities):
                 continue
-            item = project(s, r)
             out.append({
                 "id": item["id"], "channel": names.get(r.channel_id, item["title"]),
                 "game": item["game"], "text_zh": r.text_zh, "text_raw": r.text_raw,

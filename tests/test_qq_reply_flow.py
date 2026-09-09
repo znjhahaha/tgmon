@@ -43,12 +43,12 @@ class _Recorder:
         self.calls = []
 
     async def text(self, openid, content, msg_id=None, msg_seq=None,
-                   msg_type=None):
+                   msg_type=None, bot=None):
         self.calls.append(("text", content[:20], msg_seq))
         return "ROBOT1.0"
 
     async def media(self, openid, file_info, msg_id=None, msg_seq=None,
-                    content=None):
+                    content=None, bot=None):
         self.calls.append(("media", str(file_info)[:12], msg_seq))
         return "ROBOT1.0"
 
@@ -73,7 +73,7 @@ async def test_media_flow_sends_hint_then_burst(rec, monkeypatch):
     from tgmon.qqbot.commands import Reply
     from tgmon.qqbot import media as qq_media
 
-    async def _fake_upload(openid, thumb, raise_fatal=False):
+    async def _fake_upload(openid, thumb, raise_fatal=False, bot=None):
         return "FILEINFO_X"
 
     monkeypatch.setattr(qq_media, "upload_image", _fake_upload)
@@ -104,7 +104,7 @@ async def test_media_upload_parallel(monkeypatch):
     running = []
     order = []
 
-    async def _slow_upload(openid, thumb, raise_fatal=False):
+    async def _slow_upload(openid, thumb, raise_fatal=False, bot=None):
         running.append(thumb)
         # 两个任务都进入后再放行 —— 串行实现里第二个不会在第一个完成前启动
         while len(running) < 2:
@@ -114,10 +114,10 @@ async def test_media_upload_parallel(monkeypatch):
 
     monkeypatch.setattr(qq_media, "upload_image", _slow_upload)
 
-    async def _text(openid, content, msg_id=None, msg_seq=None):
+    async def _text(openid, content, msg_id=None, msg_seq=None, bot=None):
         return "ok"
 
-    async def _media(openid, fi, msg_id=None, msg_seq=None):
+    async def _media(openid, fi, msg_id=None, msg_seq=None, bot=None):
         return "ok"
 
     monkeypatch.setattr(qq_client, "send_group_text", _text)
@@ -137,7 +137,7 @@ async def test_too_many_replies_truncated(rec, monkeypatch):
     from tgmon.qqbot.commands import Reply
     from tgmon.qqbot import media as qq_media
 
-    async def _fake_upload(openid, thumb, raise_fatal=False):
+    async def _fake_upload(openid, thumb, raise_fatal=False, bot=None):
         return "FI"
 
     monkeypatch.setattr(qq_media, "upload_image", _fake_upload)
@@ -172,7 +172,7 @@ async def test_failed_upload_skipped_not_fatal(rec, monkeypatch):
     from tgmon.qqbot.commands import Reply
     from tgmon.qqbot import media as qq_media
 
-    async def _fake_upload(openid, thumb, raise_fatal=False):
+    async def _fake_upload(openid, thumb, raise_fatal=False, bot=None):
         return None  # 上传失败降级
 
     monkeypatch.setattr(qq_media, "upload_image", _fake_upload)

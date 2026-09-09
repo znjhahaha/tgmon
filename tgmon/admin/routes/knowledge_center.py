@@ -113,7 +113,11 @@ async def memory_save(cid: int, key: str = Form(""), value: str = Form(""), user
             raise HTTPException(400)
         identity = conv.context_state or {}
     from ...memory import remember
-    remember(identity.get("group", ""), identity.get("member", ""), value, key=key)
+    from ...conversation_scope import activate
+    if not identity.get("namespaced"):
+        raise HTTPException(409, "旧记录归属待确认，请由成员重新保存")
+    with activate({"app_id": identity.get("bot", "")}, identity.get("group", ""), identity.get("member", "")):
+        remember(identity.get("group", ""), identity.get("member", ""), value, key=key)
     return redirect("/kb?tab=memory")
 
 
@@ -126,9 +130,33 @@ async def memory_forget(cid: int, query: str = Form(""), user: str = Depends(req
             raise HTTPException(404)
         identity = conv.context_state or {}
     if identity.get("member"):
-        forget("user", identity["member"], query or None, group=identity.get("group", ""))
+        from ...conversation_scope import activate
+        from ...member_profile import forget_fact
+        if identity.get("namespaced"):
+            with activate({"app_id": identity.get("bot", "")}, identity.get("group", ""), identity["member"]):
+                forget_fact(identity["member"], query or None)
+                forget("user", identity["member"], query or None, group=identity.get("group", ""))
+        else:
+            forget("conversation", str(cid), query or None)
     else:
         forget("conversation", str(cid), query or None)
+    return redirect("/kb?tab=memory")
+
+
+@router.post("/profile/{pid}/forget")
+async def profile_forget(pid: int, query: str = Form(""), user: str = Depends(require_admin)):
+    with session_scope() as s:
+        profile = s.get(MemberProfile, pid)
+        if profile is None:
+            raise HTTPException(404)
+        identity = profile.scope_data or {}
+        if not identity.get("member"):
+            s.delete(profile)
+            return redirect("/kb?tab=memory")
+    from ...conversation_scope import activate
+    from ...member_profile import forget_fact
+    with activate({"app_id": identity.get("bot", "")}, identity.get("group", ""), identity["member"]):
+        forget_fact(identity["member"], query or None)
     return redirect("/kb?tab=memory")
 
 

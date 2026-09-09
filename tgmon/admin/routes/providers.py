@@ -50,10 +50,37 @@ def _list() -> list[dict]:
 
 @router.get("")
 async def page(request: Request, user: str = Depends(require_admin)):
+    from ... import settings
     return render(request, "providers.html", {
         "nav_active": "providers", "providers": _list(),
         "protocols": list(PROTOCOLS.keys()),
+        "purposes": [(key, label, settings.get(f"AI_{key.upper()}_DEADLINE"),
+                      ", ".join((settings.get("AI_PURPOSE_PROVIDERS") or {}).get(key, [])))
+                     for key, label in (("chat", "对话"), ("translate", "翻译"), ("summary", "摘要"))],
     })
+
+
+@router.post("/purposes")
+async def purposes(request: Request, user: str = Depends(require_admin)):
+    from ... import settings
+    from fastapi import HTTPException
+    form = await request.form()
+    choices, values = {}, {}
+    known = {provider["name"] for provider in _list()}
+    for purpose in ("chat", "translate", "summary"):
+        names = [name.strip() for name in str(form.get(purpose) or "").split(",") if name.strip()]
+        if any(name not in known for name in names):
+            raise HTTPException(400, "后端名称不存在")
+        try:
+            deadline = int(str(form.get(f"{purpose}_deadline") or "30"))
+        except ValueError:
+            raise HTTPException(400, "截止时间必须为整数")
+        if not 1 <= deadline <= 300:
+            raise HTTPException(400, "截止时间必须为 1 至 300 秒")
+        choices[purpose] = names
+        values[f"AI_{purpose.upper()}_DEADLINE"] = deadline
+    settings.set_many({**values, "AI_PURPOSE_PROVIDERS": choices})
+    return redirect("/providers")
 
 
 def _parse_headers(raw: str) -> tuple[dict | None, str | None]:

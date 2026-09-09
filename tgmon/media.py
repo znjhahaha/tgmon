@@ -11,6 +11,10 @@ import io
 import logging
 import subprocess
 import tempfile
+import hashlib
+import json
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +51,13 @@ def _set_action(text: str) -> None:
 @dataclass
 class MediaOut:
     kind: str
+    source_message_id: int | None = None
+    source_identity: str | None = None
+    status: str = "ready"
+    error: str | None = None
+    sha256: str | None = None
+    original_path: str | None = None
+    original_bytes: int = 0
     thumb_path: str | None = None   # 相对 MEDIA_DIR
     thumb_bytes: int = 0
     width: int | None = None
@@ -62,6 +73,25 @@ class MediaOut:
     video_path: str | None = None
     video_bytes: int = 0
     video_status: str | None = None   # ok / skipped_* / failed / None(未尝试)
+
+
+def describe(message) -> MediaOut | None:
+    photo = getattr(message, "photo", None)
+    doc = getattr(message, "document", None)
+    if photo is None and doc is None:
+        return None
+    item = photo or doc
+    mime = getattr(doc, "mime_type", "") or ""
+    kind = "photo" if photo is not None else "video" if (
+        getattr(message, "video", None) is not None or mime.startswith("video/")) else "document"
+    attrs = _video_attrs(doc) if doc is not None else None
+    return MediaOut(kind=kind, source_message_id=message.id,
+        source_identity=f"{kind}:{getattr(item, 'id', '')}",
+        orig_bytes=int(getattr(item, "size", 0) or 0), mime=mime or None,
+        width=getattr(attrs, "w", None), height=getattr(attrs, "h", None),
+        duration=int(getattr(attrs, "duration", 0) or 0) or None,
+        has_spoiler=_media_spoiled(message), status="queued",
+        video_status="queued" if kind == "video" else None)
 
 
 def _target_dir(channel_id: int) -> Path:
@@ -83,12 +113,13 @@ def _save_webp(raw: bytes, dest: Path, max_width: int) -> tuple[int, int, int] |
                 w = max_width
                 img = img.resize((w, h), Image.LANCZOS)
             quality = int(settings.get("WEBP_QUALITY") or 80)
-            img.save(dest, "WEBP", quality=quality, method=4)
+            temp = dest.with_suffix(".partial")
+            img.save(temp, "WEBP", quality=quality, method=4)
+            temp.replace(dest)
         return dest.stat().st_size, w, h
     except Exception as e:
         logger.warning("保存 WebP 失败 %s: %s", dest, e)
-        if dest.exists():
-            dest.unlink(missing_ok=True)
+        dest.with_suffix(".partial").unlink(missing_ok=True)
         return None
 
 
@@ -131,7 +162,7 @@ async def _ffmpeg_first_frame(client, doc: Document) -> bytes | None:
             src = Path(td) / "head.bin"
             out = Path(td) / "frame.jpg"
             src.write_bytes(bytes(buf))
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(subprocess.run,
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                  "-i", str(src), "-frames:v", "1", "-q:v", "3", str(out)],
                 capture_output=True, timeout=45,
@@ -166,48 +197,108 @@ async def _archive_video(client, message, channel_id: int, out: MediaOut,
     大小（min(全局, 频道)）→ 时长。
     """
     out.video_status = "skipped_disabled"
+    out.status = "ready"
     if not settings.get("VIDEO_ARCHIVE_ENABLED"):
         return
     # 大小上限：频道值（0=继承全局）与全局取小
     global_mb = int(settings.get("VIDEO_MAX_MB") or 0)
-    cap_mb = min(global_mb, video_max_mb) if video_max_mb else global_mb
+    caps = [value for value in (global_mb, video_max_mb) if value > 0]
+    cap_mb = min(caps) if caps else 0
     if cap_mb and out.orig_bytes > cap_mb * 1024 * 1024:
         out.video_status = "skipped_size"
+        out.error = f"源文件超过 {cap_mb} MB 归档限制"
         return
-    if out.duration and out.duration > int(settings.get("VIDEO_MAX_SECONDS") or 180):
+    duration_limit = int(settings.get("VIDEO_MAX_SECONDS") or 0)
+    if duration_limit and out.duration and out.duration > duration_limit:
         out.video_status = "skipped_duration"
+        out.error = f"视频超过 {duration_limit} 秒归档限制"
         return
 
     async with _VIDEO_SEM:          # 同一时刻只有一路转码
         dest_dir = VIDEO_DIR / str(channel_id)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f"{message.id}.mp4"
-        with tempfile.TemporaryDirectory(dir=str(VIDEO_DIR)) as td:
-            src = Path(td) / "src.mp4"
-            try:
-                _set_action(f"下载视频 {channel_id}/{message.id}")
-                await client.download_media(message, file=str(src))
-                if not src.exists() or src.stat().st_size == 0:
-                    raise RuntimeError("下载为空")
-                # 转码丢给线程池：ffmpeg 是阻塞 subprocess，直接跑会卡住
-                # 事件循环 —— 心跳停止、任务队列停摆，概览页看着就是 worker 挂了
+        source_identity = getattr(getattr(message, "document", None), "id", message.id)
+        src = dest_dir / f"{message.id}-{source_identity}.original.mp4"
+        dest = dest_dir / f"{message.id}-{source_identity}.mp4"
+        temp = dest.with_suffix(".partial.mp4")
+        try:
+            _set_action(f"下载视频 {channel_id}/{message.id}")
+            if not src.exists():
+                if not await asyncio.to_thread(_has_space, out.orig_bytes):
+                    out.video_status, out.status, out.error = "waiting_space", "waiting_space", "磁盘空间或媒体配额不足"
+                    return
+                await _download_source(client, message, src, out.orig_bytes)
+            if out.orig_bytes and src.stat().st_size != out.orig_bytes:
+                raise RuntimeError("源文件大小校验失败")
+            out.original_path = src.relative_to(VIDEO_DIR).as_posix()
+            out.original_bytes = src.stat().st_size
+            out.sha256 = await asyncio.to_thread(_hash_file, src)
+            if await asyncio.to_thread(_playable, src):
+                dest = src
+            else:
                 _set_action(f"转码视频 {channel_id}/{message.id}.mp4")
-                await asyncio.to_thread(_transcode, src, dest)
-                out.video_path = f"{channel_id}/{dest.name}"
-                out.video_bytes = dest.stat().st_size
-                out.video_status = "ok"
-                logger.info("视频归档 %s/%s: %.1f MB → %.1f MB",
-                            channel_id, message.id,
-                            out.orig_bytes / 1048576, out.video_bytes / 1048576)
-            except Exception as e:
-                out.video_status = "failed"
-                logger.warning("视频归档失败 %s/%s: %s", channel_id, message.id, e)
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            finally:
-                _set_action("")
+                await asyncio.to_thread(_transcode, src, temp)
+                if not temp.is_file() or not temp.stat().st_size:
+                    raise RuntimeError("播放版本为空")
+                temp.replace(dest)
+            out.video_path = dest.relative_to(VIDEO_DIR).as_posix()
+            out.video_bytes = dest.stat().st_size
+            out.video_status, out.status = "ok", "ready"
+        except Exception as e:
+            out.video_status, out.status, out.error = "failed", "failed", str(e)[:1000]
+            logger.warning("视频归档失败 %s/%s: %s", channel_id, message.id, e)
+            temp.unlink(missing_ok=True)
+        finally:
+            _set_action("")
+
+
+def _has_space(size: int) -> bool:
+    reserve = int(settings.get("MEDIA_FREE_RESERVE_MB") or 256) * 1048576
+    if shutil.disk_usage(VIDEO_DIR).free < max(size, 1048576) * 2 + reserve:
+        return False
+    quota = int(settings.get("VIDEO_MAX_TOTAL_MB") or 0) * 1048576
+    if quota:
+        used = sum(p.stat().st_size for p in VIDEO_DIR.rglob("*") if p.is_file())
+        if used + size > quota:
+            return False
+    return True
+
+
+def _hash_file(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+async def _download_source(client, message, dest: Path, expected_size: int) -> None:
+    partial = dest.with_suffix(dest.suffix + ".partial")
+    chunk_size = 512 * 1024
+    offset = (partial.stat().st_size // chunk_size * chunk_size) if partial.exists() else 0
+    if hasattr(client, "iter_download"):
+        with partial.open("r+b" if partial.exists() else "wb") as stream:
+            stream.truncate(offset)
+            stream.seek(offset)
+            async for chunk in client.iter_download(message.document, offset=offset,
+                                                     request_size=chunk_size):
+                await asyncio.to_thread(stream.write, chunk)
+            await asyncio.to_thread(stream.flush)
+            await asyncio.to_thread(os.fsync, stream.fileno())
+    else:
+        await client.download_media(message, file=str(partial))
+    size = partial.stat().st_size if partial.exists() else 0
+    if not size or (expected_size and size != expected_size):
+        raise RuntimeError(f"下载未完成: {size}/{expected_size} bytes")
+    partial.replace(dest)
+
+
+def _playable(src: Path) -> bool:
+    proc = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format",
+                           "-of", "json", str(src)], capture_output=True, timeout=30, check=True)
+    data = json.loads(proc.stdout)
+    video = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
+    audio = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+    return bool(video and "mp4" in data.get("format", {}).get("format_name", "")
+                and all(s.get("codec_name") == "h264" for s in video)
+                and all(s.get("codec_name") in ("aac", "mp3") for s in audio))
 
 
 def _transcode(src: Path, dest: Path) -> None:
@@ -233,7 +324,8 @@ def _transcode(src: Path, dest: Path) -> None:
 
 async def process(client, message, channel_id: int, *,
                   keep_video: bool = False,
-                  video_max_mb: int = 0) -> MediaOut | None:
+                  video_max_mb: int = 0,
+                  defer_archive: bool = False) -> MediaOut | None:
     """处理一条消息的媒体。返回 None 表示这条没有需要保存的媒体。
 
     keep_video / video_max_mb 来自频道配置，只对视频生效。
@@ -242,23 +334,37 @@ async def process(client, message, channel_id: int, *,
         return None
 
     dest_dir = _target_dir(channel_id)
-    stem = f"{message.id}"
+    identity = describe(message)
+    asset = getattr(message, "photo", None) or getattr(message, "document", None)
+    stem = f"{message.id}-{getattr(asset, 'id', message.id)}"
     spoiled = _media_spoiled(message)
 
     # ---------- 图片 ----------
     if getattr(message, "photo", None) is not None:
         raw = await client.download_media(message, file=bytes)
         if not raw:
-            return MediaOut(kind="photo", has_spoiler=spoiled)
+            return MediaOut(kind="photo", source_message_id=message.id,
+                            has_spoiler=spoiled, status="failed", error="图片下载为空")
+        original = VIDEO_DIR / str(channel_id) / f"{message.id}-{getattr(message.photo, 'id', message.id)}.original"
+        original.parent.mkdir(parents=True, exist_ok=True)
+        if not await asyncio.to_thread(_has_space, len(raw)):
+            return MediaOut(kind="photo", source_message_id=message.id, status="waiting_space",
+                            error="磁盘空间或媒体配额不足")
+        await asyncio.to_thread(_save_original, original, raw)
         dest = dest_dir / f"{stem}.webp"
-        saved = _save_webp(raw, dest, int(settings.get("PHOTO_WIDTH") or 1280))
+        saved = await asyncio.to_thread(_save_webp, raw, dest, int(settings.get("PHOTO_WIDTH") or 1280))
         if saved is None:
-            return MediaOut(kind="photo", orig_bytes=len(raw), has_spoiler=spoiled)
+            return MediaOut(kind="photo", source_message_id=message.id,
+                            orig_bytes=len(raw), has_spoiler=spoiled, status="failed", error="图片校验失败")
         size, w, h = saved
-        ph, dh = imghash.hashes_for(dest)
-        return MediaOut(kind="photo", thumb_path=f"{channel_id}/{dest.name}",
+        ph, dh = await asyncio.to_thread(imghash.hashes_for, dest)
+        return MediaOut(kind="photo", source_message_id=message.id,
+                        source_identity=identity.source_identity if identity else None,
+                        thumb_path=f"{channel_id}/{dest.name}",
                         thumb_bytes=size, width=w, height=h,
                         orig_bytes=len(raw), mime="image/webp",
+                        original_path=original.relative_to(VIDEO_DIR).as_posix(),
+                        original_bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
                         phash=ph, dhash=dh, has_spoiler=spoiled)
 
     doc = getattr(message, "document", None)
@@ -272,6 +378,8 @@ async def process(client, message, channel_id: int, *,
     va = _video_attrs(doc) if is_video else None
     out = MediaOut(
         kind=kind,
+        source_message_id=message.id,
+        source_identity=identity.source_identity if identity else None,
         orig_bytes=getattr(doc, "size", 0) or 0,
         mime=mime or None,
         duration=int(va.duration) if va and va.duration else None,
@@ -280,7 +388,7 @@ async def process(client, message, channel_id: int, *,
         has_spoiler=spoiled,
     )
 
-    # ---------- 视频 / 文档：只取 thumb，绝不下完整文件 ----------
+    # Previews are independent from source-file archiving.
     thumbs = getattr(doc, "thumbs", None)
     raw = None
     if thumbs:
@@ -295,19 +403,35 @@ async def process(client, message, channel_id: int, *,
 
     if raw:
         dest = dest_dir / f"{stem}_thumb.webp"
-        saved = _save_webp(raw, dest, int(settings.get("THUMB_WIDTH") or 640))
+        saved = await asyncio.to_thread(_save_webp, raw, dest, int(settings.get("THUMB_WIDTH") or 640))
         if saved is not None:
             size, w, h = saved
             out.thumb_path = f"{channel_id}/{dest.name}"
             out.thumb_bytes = size
-            ph, dh = imghash.hashes_for(dest)
+            ph, dh = await asyncio.to_thread(imghash.hashes_for, dest)
             out.phash, out.dhash = ph, dh
             # 视频的真实分辨率来自属性，别被缩略图覆盖
             if not is_video:
                 out.width, out.height = w, h
 
-    # ---------- 归档（可选路径）：双闸门都开才下载 ----------
+    # Compatibility callers may request archiving; workers use a separate queue.
     if is_video and keep_video:
-        await _archive_video(client, message, channel_id, out, video_max_mb)
+        if defer_archive:
+            # The source message has to be downloaded through the worker, but
+            # doing that inline would hold up ingestion and translation. The
+            # pipeline persists this marker and schedules an archive task.
+            out.video_status = ("queued" if settings.get("VIDEO_ARCHIVE_ENABLED")
+                                else "skipped_disabled")
+        else:
+            await _archive_video(client, message, channel_id, out, video_max_mb)
 
     return out
+
+
+def _save_original(dest: Path, raw: bytes) -> None:
+    temp = dest.with_suffix(dest.suffix + ".partial")
+    with temp.open("wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temp.replace(dest)

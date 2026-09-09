@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -18,7 +20,7 @@ from ..bootstrap import init_all
 from ..paths import MEDIA_DIR, ensure_dirs
 from .routes import (
     account, api, auth, channels, dedupe, feeds, glossary_ui, media_serve,
-    messages, outputs_cfg, overview, prompts_ui, providers, qqbot_cb,
+    messages, outputs_cfg, overview, plugins, prompts_ui, providers, qqbot_cb,
     qqbot_ui, share, system,
 )
 
@@ -44,8 +46,22 @@ def create_app() -> FastAPI:
     ensure_dirs()
     init_all()
 
+    @asynccontextmanager
+    async def lifespan(app):
+        from ..qqbot.runtime import run_queue
+        tasks = [asyncio.create_task(run_queue(queue)) for queue in
+                 ("conversation", "conversation", "conversation", "qq_cards")]
+        try:
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            from ..extension_runtime import close
+            await close()
+
     app = FastAPI(title="tgmon 后台", docs_url=None, redoc_url=None,
-                  openapi_url=None)
+                  openapi_url=None, lifespan=lifespan)
     # 大陆访问的关键：文本响应压缩后通常只有几 KB
     app.add_middleware(GZipMiddleware, minimum_size=500)
 
@@ -73,6 +89,7 @@ def create_app() -> FastAPI:
     # qqbot_ui 是管理页。两者共用 /qqbot 前缀但路径不重叠
     app.include_router(qqbot_cb.router)
     app.include_router(qqbot_ui.router)
+    app.include_router(plugins.router)
     app.include_router(system.router)
     app.include_router(api.router)
     app.include_router(feeds.router)

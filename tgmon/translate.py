@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import asyncio
+import copy
+import json
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -142,11 +147,41 @@ async def translate_with_kb(text: str, game: str | None = None) -> TranslateResu
                            bilingual_policy="always")
 
 
+_translation_jobs: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Task] = {}
+
+
 async def translate(text: str, prompt: str, game: str | None = None,
                     entities_data: dict | None = None,
                     use_cache: bool | None = None,
                     hits: list | None = None,
-                    bilingual_policy: str = "zh_first") -> TranslateResult:
+                    bilingual_policy: str = "zh_first", theme: str = "gaming") -> TranslateResult:
+    """Coalesce concurrent, identical requests and isolate returned results."""
+    request = {"text": text, "prompt": prompt, "game": game,
+               "entities": entities_data, "use_cache": use_cache,
+               "hits": [vars(hit) if hasattr(hit, "__dict__") else str(hit) for hit in hits or []],
+               "policy": bilingual_policy, "theme": theme, "kb": settings.get("KB_VERSION")}
+    digest = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True,
+                                       default=str).encode()).hexdigest()
+    key = (asyncio.get_running_loop(), digest)
+    task = _translation_jobs.get(key)
+    shared = task is not None
+    if task is None:
+        task = asyncio.create_task(_translate_impl(text, prompt, game, entities_data,
+                                                   use_cache, hits, bilingual_policy, theme))
+        _translation_jobs[key] = task
+        task.add_done_callback(lambda done: _translation_jobs.pop(key, None)
+                               if _translation_jobs.get(key) is done else None)
+    result = copy.deepcopy(await asyncio.shield(task))
+    if shared and result.status == "ok":
+        result.from_cache, result.tokens_in, result.tokens_out, result.cost = True, 0, 0, 0.0
+    return result
+
+
+async def _translate_impl(text: str, prompt: str, game: str | None = None,
+                    entities_data: dict | None = None,
+                    use_cache: bool | None = None,
+                    hits: list | None = None,
+                    bilingual_policy: str = "zh_first", theme: str = "gaming") -> TranslateResult:
     """把爆料原文译成中文。text 为空时直接 skipped（纯图消息零调用）。
 
     entities_data 是 kb.annotate 标注出的实体，注入后模型能拿到属性做消歧义
@@ -167,14 +202,16 @@ async def translate(text: str, prompt: str, game: str | None = None,
 
     # Classification hits may be cross-game and deduplicated by entity. Reload
     # reviewed aliases so every spelling in this translation is represented.
-    pool = glossary.terms_for(game) if game else glossary.terms_all()
+    pool = (glossary.terms_for(game) if game else glossary.terms_all()) if theme == "gaming" else []
     hits = glossary.translation_hits(text, [*(hits or []), *pool], game)
     full_prompt = prompt + glossary.build_table(hits)
     from .kb.service import reference_context
     import asyncio
-    reference, _revision = await asyncio.to_thread(reference_context, text, game)
+    reference, _revision = (await asyncio.to_thread(reference_context, text, game)
+                            if theme == "gaming" else ("", ""))
     if reference:
         full_prompt += "\n\n参考资料（仅解释背景，规范译名以术语表为准）：\n" + reference
+    full_prompt += f"\n\n主题：{theme}；目标语言：zh；翻译协议：3。"
     full_prompt += ("\n\n本次翻译策略：完整翻译标题和正文；未知专名给中文暂译并首次附原词，"
                     "不能把暂译说成官方名称。英文排版粘连应按语义还原，保留原始数值、链接和代码。")
 
@@ -232,6 +269,17 @@ async def translate(text: str, prompt: str, game: str | None = None,
     miss = (glossary.check_translation(res.text, hits)
             if settings.get("GLOSSARY_CHECK_ENABLED") else [])
     corrected_text, corrected = glossary.correct_translation(res.text, hits)
+    issue = validate_literals(text, corrected_text)
+    if theme != "gaming" and not issue:
+        from .themes import get_theme
+        terms = get_theme(theme).config.get("terms", {})
+        if any(str(source).casefold() in text.casefold() and str(target) not in corrected_text
+               for source, target in terms.items()):
+            issue = "主题术语校验失败，保留原文并等待重试"
+    if issue:
+        return TranslateResult(status="failed", error=issue, provider_name=res.provider_name,
+                               model=res.model, tokens_in=res.tokens_in, tokens_out=res.tokens_out,
+                               cost=cost, glossary_hits=hit_names)
     if settings.get("TRANSLATE_CACHE_ENABLED"):
         # 重译时不读缓存但仍写入，这样后续相同内容能命中新结果
         _cache_put(key, corrected_text, res.provider_name, res.model)
@@ -245,3 +293,15 @@ async def translate(text: str, prompt: str, game: str | None = None,
         model=res.model, tokens_in=res.tokens_in, tokens_out=res.tokens_out,
         cost=cost, glossary_hits=hit_names, glossary_miss=miss, glossary_corrected=corrected,
     )
+
+
+def validate_literals(source: str, translated: str) -> str | None:
+    patterns = (("数字", r"\d+(?:[.,]\d+)*"),
+                ("链接", r"https?://[^\s<>\]\)]+"),
+                ("代码", r"`[^`\n]+`"))
+    for label, pattern in patterns:
+        expected = Counter(re.findall(pattern, source))
+        actual = Counter(re.findall(pattern, translated))
+        if expected - actual:
+            return f"译后{label}校验失败，保留原文并等待重试"
+    return None

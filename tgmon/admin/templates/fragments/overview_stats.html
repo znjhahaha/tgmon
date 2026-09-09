@@ -24,6 +24,28 @@
   <span class="dim">心跳 {{ worker.heartbeat_at|ago }}</span>
 </div>
 
+<div class="card" style="margin-top:12px;padding:10px 14px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+    <b style="font-size:13px">频道拉取健康度</b>
+    <span class="dim" style="font-size:11px">
+      上次对齐 {{ s.last_catchup_at|ago if s.last_catchup_at else '从未' }}
+      · 每 {{ (s.catchup_every // 60) if s.catchup_every >= 60 else s.catchup_every }}{{ ' 分钟' if s.catchup_every >= 60 else ' 秒' }}自动一轮
+    </span>
+    <span class="spacer"></span>
+    <a class="btn sm ghost" href="/channels">频道管理</a>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px">
+    {% for c in s.channel_health %}
+    <span class="tag {{ 'ok' if (c.gap is not none and c.gap <= 0) else ('warn' if c.gap is not none else '') }}"
+          title="最新消息 {{ c.last_message_at|ago if c.last_message_at else '无记录' }}{% if c.gap is not none %} · TG 最新比已入库多 {{ c.gap }} 条{% endif %}">
+      {{ c.title[:18] }} · {% if c.gap is none %}待对齐{% elif c.gap <= 0 %}同步{% else %}落后 {{ c.gap }}{% endif %}
+    </span>
+    {% else %}
+    <span class="dim" style="font-size:12px">没有启用中的 telegram 频道。</span>
+    {% endfor %}
+  </div>
+</div>
+
 <div id="tasks" style="margin-top:14px">
   <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
     <b style="font-size:14px">实时任务与拉取控制台</b>

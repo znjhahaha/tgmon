@@ -67,11 +67,54 @@ def dhash(img: Image.Image) -> str | None:
         return None
 
 
+def _trim_letterbox(img: Image.Image) -> Image.Image:
+    """裁掉纯黑/纯白遮幅边（漫画分镜、宽屏适配的上下黑条）。每边最多 45%。
+
+    黑边占到画面一半以上时，phash 的低频与 dhash 的梯度都被黑边主导：
+    两张内容完全不同的遮幅图，dhash 距离可以小到 4（2026-09 案例：遮幅
+    截图互撞误判）。裁掉边再算，指纹才反映内容区。保守起见只认接近纯黑
+    /纯白且几乎无噪声的行列，避免误裁正常图的暗部天空。
+    """
+    try:
+        a = np.asarray(img.convert("L"), dtype=np.uint8)
+        if a.ndim != 2 or a.size == 0:
+            return img
+        h, w = a.shape
+
+        def is_pad(line: np.ndarray) -> bool:
+            return line.std() < 6.0 and (line.mean() < 24 or line.mean() > 232)
+
+        def scan(get, n, limit):
+            i = 0
+            while i < limit and is_pad(get(i)):
+                i += 1
+            return i
+
+        top = scan(lambda i: a[i, :], h, int(h * 0.45))
+        bottom = scan(lambda i: a[h - 1 - i, :], h, int(h * 0.45))
+        left = scan(lambda i: a[:, i], w, int(w * 0.45))
+        right = scan(lambda i: a[:, w - 1 - i], w, int(w * 0.45))
+        box = (left, top, w - right, h - bottom)
+        if (top + bottom >= h or left + right >= w
+                or box == (0, 0, w, h)):
+            return img
+        return img.crop(box)
+    except Exception as e:
+        logger.debug("letterbox 裁剪失败: %s", e)
+        return img
+
+
 def hashes_for(path) -> tuple[str | None, str | None]:
     try:
         with Image.open(path) as img:
             img.load()
-            return phash(img), dhash(img)
+            img = _trim_letterbox(img)
+            ph, dh = phash(img), dhash(img)
+            # 近纯色图（视频黑首帧 / 纯色背景）的哈希无区分度，存 None：
+            # 存全零会让任意两个黑首帧媒体在判重时距离 0-1，全部误判
+            from .dedup import informative
+            return (ph if informative(ph) else None,
+                    dh if informative(dh) else None)
     except Exception as e:
         logger.debug("打开图片失败 %s: %s", path, e)
         return None, None

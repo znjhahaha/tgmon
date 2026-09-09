@@ -11,7 +11,8 @@ from .. import settings
 from ..db import session_scope
 from ..glossary import normalize_game
 from ..message_query import by_ids
-from ..models import MonitorMessage, QqDelivery, QqGroup, QqPending
+from ..models import (MonitorMessage, QqBot, QqBotCapability, QqDelivery,
+                      QqGroup, QqPending)
 from ..sharing import bundle_cards, create_bundle
 
 
@@ -31,9 +32,21 @@ def enqueue(message_id: int, force=False) -> int:
         channels = settings.get("QQ_CHANNEL_IDS") or []
         if channels and message.channel_id not in channels and not force:
             return 0
-        groups = s.query(QqGroup).filter_by(enabled=True).all()
+        # 多机器人扇出：只给「归属机器人可用」的群排队。明确归属且机器人
+        # 启用 → 推；无归属（迁移前存量）→ 仅在恰好 ≤1 个启用机器人时推
+        #（单机器人旧部署零变化；多机器人时无从判断归属，跳过）
+        enabled_rows = s.query(QqBot).filter(QqBot.enabled.is_(True)).all()
+        caps = {c.bot_id: c for c in s.query(QqBotCapability).all()}
+        bots_enabled = {b.id for b in enabled_rows
+                        if caps.get(b.id) is None or caps[b.id].proactive_enabled}
+        groups = [g for g in s.query(QqGroup).filter_by(enabled=True).all()
+                  if g.bot_id in bots_enabled
+                  or (g.bot_id is None and len(enabled_rows) <= 1
+                      and (not enabled_rows or bool(bots_enabled)))]
         count = 0
         for group in groups:
+            if group.themes and record.get("theme", "gaming") not in group.themes:
+                continue
             if group.games and record["game"] not in [normalize_game(g) for g in group.games]:
                 continue
             if force:
@@ -72,7 +85,10 @@ async def flush_pending(now: datetime | None = None) -> int:
             sid = await asyncio.to_thread(create_bundle, mids)
             key = hashlib.sha256(f"{target}:{ids}:{sid}".encode()).hexdigest()
             with session_scope() as s:
+                group = s.query(QqGroup).filter_by(group_openid=target).first()
                 delivery = QqDelivery(group_openid=target, message_id=mids[0], bundle_id=sid,
+                                      bot_id=group.bot_id if group else None,
+                                      source="source_message", trigger="subscription",
                                       dedup_key=key, status="pending", parts={})
                 s.add(delivery)
                 s.flush()
@@ -96,13 +112,39 @@ async def deliver(did: int) -> None:
         row = s.get(QqDelivery, did)
         if row is None:
             return
+        if row.status in ("done", "review", "blocked", "failed"):
+            return
         group = s.query(QqGroup).filter_by(group_openid=row.group_openid, enabled=True).first()
         if not group:
             row.status, row.error = "failed", "群已停用"
             s.query(QqPending).filter_by(delivery_id=did).update({"status": "failed"})
             return
         sid, target, key = row.bundle_id, row.group_openid, row.dedup_key
+        owner = row.bot_id or group.bot_id
     from ..sharing import bundle_url
+    from . import client as qq_client
+    try:
+        bot = qq_client.resolve_bot(bot_id=owner) if owner else qq_client.resolve_bot()
+    except qq_client.QqApiError as e:
+        with session_scope() as s:
+            row = s.get(QqDelivery, did)
+            row.status, row.error, row.next_retry_at = "failed", f"机器人不可用: {e.message}", None
+            s.query(QqPending).filter_by(delivery_id=did).update({"status": "failed"})
+        return
+    if not bot.get("proactive_enabled", True):
+        with session_scope() as s:
+            row = s.get(QqDelivery, did)
+            row.status, row.error, row.next_retry_at = "blocked", "主动推送权限已停用", None
+        return
+    from . import events
+    prior = events.delivery_parts(key)
+    if not any(part.get("status") in ("done", "unknown", "sending") for part in prior.values()):
+        with session_scope() as s:
+            mids = [r.message_id for r in s.query(QqPending).filter_by(delivery_id=did)]
+        if mids:
+            sid = await asyncio.to_thread(create_bundle, mids)
+            with session_scope() as s:
+                s.get(QqDelivery, did).bundle_id = sid
     try:
         paths, url, items = await asyncio.to_thread(bundle_cards, sid)
     except Exception as exc:
@@ -116,10 +158,17 @@ async def deliver(did: int) -> None:
                for i, p in enumerate(paths[:4])] or [Reply(text=url, bundle_id=sid)]
     if len(paths) > 4:
         replies.append(Reply(text=url))
-    parts = await send_parts(target, replies, key=key)
+    parts = await send_parts(target, replies, key=key, bot=bot)
     if not parts:
         return
     states = [p.get("status") for p in parts.values()]
+    permission_error = next((p.get("error") for p in parts.values()
+                             if "40034105" in (p.get("error") or "")), "")
+    if permission_error:
+        # This is account capability, not a transient batch failure. Stop
+        # creating new proactive attempts for this bot while preserving the
+        # current delivery record for operators to inspect.
+        qq_client.disable_proactive(bot.get("id"), permission_error)
     if any(x == "pending" for x in states):
         return
     with session_scope() as s:

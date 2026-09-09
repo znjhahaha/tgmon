@@ -34,10 +34,11 @@ class AIResult:
     model: str = ""
     error: str | None = None
     elapsed: float = 0.0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return self.error is None and bool(self.text.strip())
+        return self.error is None and bool(self.text.strip() or self.tool_calls)
 
 
 class BaseProvider(ABC):
@@ -45,6 +46,8 @@ class BaseProvider(ABC):
 
     def __init__(self, cfg: ProviderConfig):
         self.cfg = cfg
+
+    capabilities = frozenset({"text", "messages"})
 
     @abstractmethod
     async def complete(self, system: str, user: str, **kwargs: Any) -> AIResult:

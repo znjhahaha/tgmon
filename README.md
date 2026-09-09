@@ -4,18 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](LICENSE)
 [![image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/znjhahaha/tgmon/pkgs/container/tgmon)
 
-Telegram 游戏爆料频道监控与分发系统：用户账号抓取 → 游戏识别 → 术语化翻译 → 三层去重，经 RSS、HTTP API、Webhook 与 QQ 机器人对外输出。
+tgmon 是一个通用资讯采集、翻译、归档与分发平台：Telegram 或插件来源 → 内容版本化 → 翻译与检索 → RSS、HTTP API、Webhook、QQ 推送和分享页。游戏主题是内置预设，也可以切换为科技、新闻等通用主题。
 
-系统面向单机、低带宽跨境链路场景设计：全部计算密集型工作（抓取、媒体处理、翻译、向量化）在一台海外 VPS 上完成，对外只输出轻量文本与缩略图。当前用于监控原神、崩坏：星穹铁道、绝区零相关爆料频道。
+系统面向单机、低带宽跨境链路场景设计：计算密集型工作在海外 VPS 上完成，对外提供统一的文本、媒体和分享投影。内置游戏主题默认覆盖原神、崩坏：星穹铁道、绝区零，但业务链路不依赖某个游戏。
 
 ## 功能特性
 
 **监控与翻译**
 
 - 基于用户账号（Telethon）监控任意已加入频道，含私密频道；后台可从账号一键同步频道列表，无需手动收集频道 ID 或邀请链接
-- 游戏识别按关键词证据归类，别名统一（崩铁 / 星铁 / HSR 均归入崩坏：星穹铁道）；网站、RSS、API 与 QQ 共用同一查询结果
-- 翻译管线：缓存 → 预算闸门 → 术语注入 → 多后端故障转移 → 译后校验；相同原文命中缓存，不重复计费
-- 视频一律不落盘：只提取首帧缩略图并保留 Telegram 原链接
+- 游戏主题按证据归类，通用主题不强行套用游戏知识；网站、RSS、API、分享与 QQ 共用同一内容投影
+- 翻译管线：缓存 → 预算闸门 → 术语注入 → 多后端故障转移 → 译后校验；相同原文请求合并，不重复翻译
+- 图片与视频独立归档：保存来源身份、原文件校验和、预览及失败状态；视频下载支持断点续传、原子落盘和转码队列，空间不足进入等待状态，不静默丢弃
 
 **知识库与检索**
 
@@ -28,10 +28,10 @@ Telegram 游戏爆料频道监控与分发系统：用户账号抓取 → 游戏
 **QQ 机器人**
 
 - 两种事件入口：QQ 开放平台 Webhook 回调，或独立 botpy 客户端走 WebSocket 桥
-- 19 个群内命令（见下文命令表），非命令文本走 AI 意图路由
-- 主动推送按游戏聚合：60 秒窗口内同一游戏的消息合批发送（每批最多 5 条），失败按指数退避重试，送达状态持久化
+- 群内命令、AI 意图路由与多轮对话记忆（见下文命令表），上下文按机器人、群、成员和私聊隔离
+- 现有推送按主题聚合：60 秒窗口内合批发送（每批最多 5 条），失败按退避重试，送达状态持久化；不增加语音、日报、提醒或主动闲聊
 - 同条爆料的多张图片按原顺序合并为一张 JPEG 长图直传 QQ：等比缩放、不裁切，上限 16000 像素高，正文随媒体消息发出；直传失败回退 URL 中转
-- 对话记忆按群话题、群成员、私聊三级隔离，支持滚动摘要、主动记忆（`/remember`）与遗忘
+- 支持多个 QQ 机器人，每个机器人独立凭据、能力状态、群归属和推送熔断
 
 **输出与分享**
 
@@ -40,10 +40,11 @@ Telegram 游戏爆料频道监控与分发系统：用户账号抓取 → 游戏
 
 **运行时与运维**
 
-- 双进程单机 Docker Compose 部署，Caddy 终止 TLS 并静态分发媒体
+- 双进程单机 Docker Compose 部署，Caddy 终止 TLS 并静态分发媒体；SQLite WAL 同时保存原始事件、内容版本和处理任务
 - 除少量启动参数外，全部配置在 Web 后台修改、即时生效
-- 发布脚本先在数据库副本上验证，再备份切换；换机 = `git clone` + 拷贝数据目录
-- 22 个测试文件、263 个测试函数的回归套件
+- 发布脚本先在数据库副本上验证，再备份切换；换机 = `git clone` + 拷贝状态目录
+- 主题、插件和 MCP 均显式配置；插件运行在独立宿主进程，外部 MCP 工具默认关闭
+- 当前回归套件为 382 个通过、3 个跳过，包含媒体、相册、记忆、推送恢复、迁移和扩展接口回归
 
 ## 架构
 
@@ -55,10 +56,11 @@ flowchart TB
         caddy["Caddy：TLS 终止、媒体静态分发"]
         admin["admin 进程：FastAPI 后台<br/>唯一配置入口 · 页面 · JSON API · RSS"]
         worker["worker 进程：Telethon 独占<br/>抓取 → 翻译 → 去重 → 出站"]
-        db[("SQLite（WAL 模式）<br/>数据 + 配置 + 任务队列")]
+        db[("SQLite（WAL + FTS5）<br/>原始事件 + 内容版本 + 配置 + 任务队列")]
         caddy --> admin
         admin <--> db
         worker <--> db
+        ext["插件来源 / MCP 工具"] -. "显式授权" .-> worker
     end
     TG["Telegram"] -->|用户会话| worker
     QQ["QQ 开放平台"] <-->|回调 / WS 桥| admin
@@ -72,7 +74,7 @@ worker  独占用户会话，执行抓取管线并消费任务队列
 
 拆分为两个进程的原因：Telethon 的会话是 SQLite 文件，两个进程同时使用同一会话会互锁并可能损坏授权状态。因此只有 worker 持有 Telegram 连接；admin 需要执行任何涉及 Telegram 的操作（发送验证码、登录、同步频道列表、测试 Provider）时，向 `task` 表写入一条任务，由 worker 执行后回填结果。网页端的 Telegram 登录流程正是通过该队列绕开了 Telethon 的 stdin 交互限制。
 
-两个进程仅通过 SQLite 通信（`app_setting` + `task` 表），WAL 模式并发读写。
+两个进程仅通过 SQLite 通信（配置、原始事件、内容版本和持久化任务表），WAL 模式并发读写。每个任务有唯一键、租约、重试次数和作用域顺序；进程重启后会恢复到期租约。采集入口先保存原始事件再交给 worker，补拉使用分页游标和缺口记录。
 
 ### 部署网络的实测约束
 
@@ -81,9 +83,9 @@ worker  独占用户会话，执行抓取管线并消费任务队列
 | 实测指标 | 设计决策 |
 |---|---|
 | 拉取国际数据 200 MB/s | 从 Telegram 抓取消息与媒体无瓶颈 |
-| 回大陆单连接仅 61 KB/s | 任何「把媒体回传大陆」的设计都会成为瓶颈 → 视频只保留深链与首帧缩略图 |
+| 回大陆单连接较慢 | QQ 发送使用预览、长图和可复用上传缓存；原始媒体留在归档目录，按状态和配额管理 |
 | OpenAI / Anthropic 官方端点 403 | Provider 的 `base_url` 必填且无默认值，需使用中转端点或 Gemini |
-| 磁盘余量小、无 swap | 视频不落盘；缩略图按 LRU + TTL 回收 |
+| 磁盘余量小、无 swap | 媒体按 7 天 TTL、总量配额和磁盘水位清理；不足时任务等待并显示原因 |
 | RTT 233 ms | 服务端渲染 + CSS 内联，无 SPA bundle |
 
 ## 快速开始
@@ -106,10 +108,10 @@ cd /opt/tgmon && ./deploy.sh
 
 使用私有镜像仓库部署时，先 `export GH_PAT=<GitHub PAT，repo + read:packages 权限>` 再执行上述命令。
 
-`deploy.sh` 自动生成 `.env` 与随机后台密码、拉取镜像、启动容器并做健康检查。此后更新版本只需：
+`deploy.sh` 自动生成 `.env` 与随机后台密码、拉取镜像、启动容器并做健康检查。生产 compose 不挂载源码，应用代码和 embedding 权重都来自镜像。此后更新版本只需：
 
 ```bash
-./deploy.sh update    # 拉取代码与镜像，滚动重启
+./deploy.sh update    # 快进拉取代码与镜像，滚动重启
 ```
 
 ### 源码部署（开发调试）
@@ -122,6 +124,18 @@ docker compose up -d --build
 ```
 
 源码模式将 `./tgmon` 只读挂载进容器：改代码后 `docker compose restart` 即生效，仅修改 `requirements.txt` 时需要重建。生产环境使用 `docker-compose.prod.yml`（纯镜像、不挂代码）。
+
+### 发布与回滚
+
+需要发布时，先在工作区完成测试，再推送 `main`。GitHub Actions 构建 `ghcr.io/znjhahaha/tgmon:latest`，生产机执行 `./deploy.sh update`。需要严格切换时使用两段式发布脚本：
+
+```bash
+release=20260909-general
+./scripts/stage_release.sh "$release"   # 在数据库副本上迁移并检查
+./scripts/apply_release.sh "$release"   # 停写、备份、切换、健康检查
+```
+
+`apply_release.sh` 会保存旧镜像、旧源码和数据库备份；新服务未通过健康检查会自动恢复。生产机上的 `.env`、`secret.key`、`sessions/`、`db/` 和 `media/` 不由 Git 管理。
 
 ### 首次配置
 
@@ -152,7 +166,9 @@ docker compose up -d --build
 | `TGMON_RETRIEVAL_ENABLED` | 否 | `true` | 消息混合检索开关 |
 | `TGMON_EMBEDDING_ENABLED` | 否 | `true` | 本地 embedding 开关 |
 | `TGMON_MEMORY_ENABLED` | 否 | `true` | QQ 对话记忆开关 |
-| `TGMON_MEMORY_TTL_DAYS` | 否 | `30` | 对话记忆保留天数 |
+| `TGMON_MEMORY_TTL_DAYS` | 否 | `30` | 短期对话记忆保留天数 |
+| `TGMON_PLUGIN_ENABLED` | 否 | `true` | 是否允许本地插件宿主 |
+| `TGMON_MCP_ENABLED` | 否 | `false` | 是否启用外部 MCP 工具，默认关闭 |
 | `TGMON_WIKI_SYNC_ENABLED` | 否 | `true` | Wiki 知识库同步开关 |
 | `TGMON_WIKI_FETCH_INTERVAL_HOURS` | 否 | `24` | Wiki 同步间隔（小时） |
 
@@ -160,7 +176,7 @@ docker compose up -d --build
 
 读取优先级为 **DB → `.env` → 内置默认**；首次启动把 `.env` 作为种子导入数据库。
 
-修改后需要重新登录 Telegram 的只有 `API_ID` / `API_HASH` / `PHONE_NUMBER`（相当于更换应用或账号）。其余配置全部热生效：prompt、术语表、去重阈值、限流、保留策略、频道开关、Provider 配置。
+修改后需要重新登录 Telegram 的只有 `API_ID` / `API_HASH` / `PHONE_NUMBER`（相当于更换应用或账号）。其余配置全部热生效：prompt、术语表、去重阈值、限流、保留策略、频道开关、Provider、主题和插件配置。MCP 只有显式授权给机器人和工具后才会连接。
 
 ## 输出接口
 
@@ -185,10 +201,12 @@ docker compose up -d --build
 ### 接入
 
 1. 在 [q.qq.com](https://q.qq.com) 创建机器人，取得 `AppID` / `AppSecret`
-2. 后台「QQ 机器人」页填入凭据并打开总开关；可选限定只推送某些频道（`QQ_CHANNEL_IDS`）、设置每群每日推送上限（默认 950，平台硬限 1000）
+2. 后台「QQ 机器人」页添加一个或多个机器人，分别保存 `AppID` / `AppSecret`；按群选择归属机器人并打开现有推送
 3. 事件入口二选一：
    - **Webhook 回调** —— 平台直接回调 `/qqbot/callback`
-   - **botpy WebSocket 桥** —— 独立 botpy 客户端连接 `/qqbot/bridge`，凭 `QQ_BRIDGE_TOKEN` 鉴权，适合回调地址不可达的部署
+   - **botpy WebSocket 桥** —— 每个机器人运行一个独立 botpy 客户端，连接 `/qqbot/bridge`，凭 `QQ_BRIDGE_TOKEN` 鉴权，适合回调地址不可达的部署
+
+机器人能力由 QQ API 实际反馈决定。主动推送遇到无权限错误会停止该机器人无效重试并保留未读内容；被动回复仍按原请求有效期处理。系统不自动发送日报、提醒、语音或闲聊消息。
 
 ### 命令表
 
@@ -216,17 +234,25 @@ docker compose up -d --build
 
 ### 推送与限流
 
-- **批次**：主动推送按游戏聚合，60 秒窗口（`QQ_BATCH_WINDOW_SECONDS`）内同一游戏的消息合为一批，每批最多 5 条；`/latest`、`/new`、`/game`、`/peek` 与推送均保留同条爆料的全部图片
+- **批次**：现有推送按主题聚合，60 秒窗口（`QQ_BATCH_WINDOW_SECONDS`）内同一主题的消息合为一批，每批最多 5 条；`/latest`、`/new`、`/game`、`/peek` 与推送均保留同条爆料的全部图片
 - **长图**：群富媒体接口一次只接受一个文件，图组按原顺序合并为一张 JPEG 长图（等比缩放、不裁切，上限 16000 像素高），正文附在同一条媒体消息上
 - **上传**：优先通过 QQ `file_data` 直传；失败才回退到已配置的 URL 中转（GitHub 图床 / 本站）
-- **重试**：发送失败按 `30s × 4^n` 指数退避（上限 1 小时），送达状态持久化，缺图或失败会明确降级，不会误报为已发送
+- **重试**：发送失败按退避策略重试，送达状态持久化；传输结果不明会进入待核实状态，不会盲目重发造成重复
 - **被动回复**：每条 @ 消息最多回复 5 次（平台限制），超限自动截断并提示
 
 ### 对话记忆
 
-- 作用域隔离：群话题、群内成员、私聊各自独立
-- 滚动上下文默认保留 8 轮（`MEMORY_RECENT_TURNS`），累计 12 轮（`MEMORY_SUMMARY_TRIGGER`）触发滚动摘要压缩
-- 记忆默认保留 30 天（`MEMORY_TTL_DAYS`）；成员可用 `/remember` 主动写入事实、`/forget` 删除
+- 作用域隔离：机器人、群话题、群内成员、私聊各自独立；群公开话题共享，个人资料只对本人可见
+- 模型接收带角色、说话人、引用和发送状态的多轮消息；近期历史按 token 预算保留，旧历史生成可追溯摘要
+- 记忆默认保留 30 天（`MEMORY_TTL_DAYS`）；成员可用 `/remember` 主动写入事实、`/forget` 删除或修订，原句和来源事件保留
+
+## 主题、插件与 MCP
+
+主题包把分类别名、术语和翻译提示词从业务代码中分离。内置 `gaming` 和 `generic`，后台可安装本地 JSON 主题；旧的 `game` 参数仍映射到游戏主题。
+
+插件通过 `plugin.json` 声明命令、工具、来源和事件能力，运行在独立 Python 宿主进程。宿主使用逐行 JSON 协议，调用有大小和超时限制；插件崩溃只记录错误，不阻塞 Telegram 采集、翻译或 QQ 推送。安装、启停、配置和错误状态可在后台「主题与扩展」查看。
+
+MCP 使用官方 Python SDK，支持 stdio 和 Streamable HTTP。服务、工具和机器人授权都必须显式配置，默认关闭；发现结果有短期缓存，调用前再次检查授权和 JSON Schema。协议细节和示例见 [`docs/extensions.md`](docs/extensions.md)。
 
 ## 知识库与检索
 
@@ -253,13 +279,13 @@ docker compose up -d --build
 
 | 层级 | 机制 | 说明 |
 |---|---|---|
-| 1. 消息 ID | `(channel_id, tg_message_id)` 唯一索引 | 零成本，防重启重放 |
-| 2. 文本指纹 | 归一化（去 emoji、折叠空白、剥频道尾巴与推广行、统一标点）后 SHA-256；SimHash 抓改动较小的转发 | 成本低 |
-| 3. 图像感知哈希 | pHash 与 dHash 取距离较小者 | 纯本地计算，不调 AI |
+| 1. 事件身份 | `(channel_id, tg_message_id, revision)` 与持久化来源事件唯一键 | 防重复回放，并保留编辑版本 |
+| 2. 文件集合 | 同一消息的附件身份、精确 SHA-256 和完整图组指纹 | 新增图片或视频不会被旧附件误判覆盖 |
+| 3. 近似关联 | 文本 SimHash、图片 pHash / dHash 只生成关联候选 | 近似内容保留，不凭单张图片隐藏整条资讯 |
 
 第 3 层实测边界（后台「去重」页内置对照表）：重新编码、强压缩、半透明水印、不透明色块水印、调亮均可命中（距离 0–2）；**裁剪与加边框无法命中**（距离 11–29），这是感知哈希的固有限制，由第 2 层兜底。
 
-命中重复不丢弃，仅标记 `duplicate_of` 指向首条；后台可展开查看「这条在哪些频道出现过」，并支持人工翻案。
+精确重复自动合并；近似候选保留为 `ContentRelation`，不删除正文或媒体。后台可展开查看相关内容并人工确认。网站、RSS、API、分享与 QQ 都从同一内容版本投影生成。
 
 ## 分享卡片
 
@@ -283,6 +309,8 @@ docker compose up -d --build
 
 1. `scripts/stage_release.sh` —— 先在数据库副本上运行新版本验证
 2. `scripts/apply_release.sh` —— 自动备份数据库后切换服务
+
+发布前还可以直接运行 `python scripts/validate_migration.py <source.sqlite3> <destination.sqlite3>`，它只在副本上建表、迁移并验证幂等，不会写入源库。`python scripts/container_smoke.py` 用于无网络容器内的依赖、路由和 FFmpeg 检查。
 
 ### 备份与迁移
 
@@ -319,9 +347,11 @@ docker compose up -d --build
 ### 测试与检查
 
 ```bash
-python -m pytest -q            # 22 个测试文件、263 个测试函数
-python -m compileall -q tgmon  # 语法检查
+python -m pytest -q --tb=short --disable-warnings
+python -m compileall -q tgmon scripts
 ```
+
+回归覆盖真实上下文、记忆修订与遗忘、编辑版本、相册跨页、媒体断点续传、精确和近似去重、QQ 发送恢复、迁移、主题、插件和 MCP。基线为 382 个通过、3 个跳过。
 
 ### 技术栈
 
@@ -332,7 +362,8 @@ python -m compileall -q tgmon  # 语法检查
 | 存储 | SQLite（WAL + FTS5），SQLAlchemy 2 |
 | AI | openai / anthropic 协议客户端，多 Provider 故障转移 |
 | 检索 | fastembed + `BAAI/bge-small-zh-v1.5`（本地 CPU 推理） |
-| 媒体 | Pillow + numpy（自实现 DCT 感知哈希，不依赖 scipy） |
+| 媒体 | Pillow + numpy + FFmpeg（原文件归档、预览、断点续传和 pHash / dHash） |
+| 扩展 | 本地 JSON 主题、进程隔离插件、官方 MCP Python SDK（stdio / Streamable HTTP） |
 | 输出 | feedgen（RSS）、HMAC 签名 Webhook |
 | Wiki | mwparserfromhell（MediaWiki 解析） |
 | 部署 | Docker Compose + Caddy + GitHub Actions → ghcr.io |
@@ -342,7 +373,7 @@ python -m compileall -q tgmon  # 语法检查
 ```
 tgmon/
 ├── admin/                  FastAPI Web 后台：路由模块、页面模板、JSON API、RSS
-├── worker/                 Telethon 生命周期、任务队列消费、定时维护
+├── worker/                 Telethon 生命周期、持久化任务队列消费、定时维护
 ├── qqbot/                  QQ 机器人：命令、Agent 对话、批次推送、媒体发送
 ├── kb/                     知识库：Wiki 同步、审核、术语导入、诊断
 ├── providers/              AI 后端协议注册表与故障转移链
@@ -353,16 +384,22 @@ tgmon/
 ├── message_query.py        统一消息查询（网站 / RSS / API / QQ 共用）
 ├── dedup.py                文本归一化 + SHA-256 + SimHash
 ├── imghash.py              pHash / dHash（自实现 DCT）
-├── media.py                缩略图提取（视频不落盘）
+├── media.py                媒体归档、预览、校验、断点续传和转码
 ├── embeddings.py           本地 embedding 下载与运行
 ├── retrieval.py            FTS5 + 向量混合检索
-├── memory.py               QQ 对话记忆（隔离 / 滚动摘要）
-├── member_profile.py       群成员画像
+├── memory.py               作用域上下文、token 预算和可追溯摘要
+├── member_profile.py       有来源证据的成员资料与修订
 ├── card.py                 分享长图卡片
 ├── sharing.py              分享快照与公开 token
 ├── outputs.py              Webhook 推送与统一序列化
 ├── prompts.py              三层 prompt 解析
-├── unified_jobs.py         统一任务调度
+├── jobs.py                 SQLite 持久化任务、租约、重试和游标
+├── content.py              内容快照、附件集合指纹和版本关联
+├── conversation_scope.py   平台 / 机器人 / 群 / 成员作用域
+├── themes.py               通用与游戏主题包
+├── plugins.py              进程隔离插件宿主
+├── mcp_bridge.py           MCP 工具发现、授权和调用
+├── source_adapters.py      插件来源到统一内容管线的适配
 ├── unified_migration.py    幂等数据迁移
 └── db.py settings.py crypto.py models.py paths.py util.py lang.py    基础设施
 ```
@@ -372,4 +409,3 @@ tgmon/
 [MIT](LICENSE)。欢迎通过 [Issue](https://github.com/znjhahaha/tgmon/issues) 与 Pull Request 反馈问题与改进。
 
 内置第三方资源遵循各自上游许可证：[htmx](https://htmx.org)（Zero-Clause BSD）、[Noto Sans SC](https://fonts.google.com/noto/specimen/Noto+Sans+SC) 字体（SIL Open Font License 1.1）。
-

@@ -130,6 +130,7 @@ class WorkerRunner:
             self.tg_user = None
         if not self._handler_registered:
             self.client.add_event_handler(self._on_new_message, events.NewMessage())
+            self.client.add_event_handler(self._on_new_message, events.MessageEdited())
             self._handler_registered = True
             logger.info("已注册消息监听器")
         await self.refresh_watchlist()
@@ -196,7 +197,9 @@ class WorkerRunner:
                     row.status = self.status
                     row.detail = self.detail
                     row.tg_user = self.tg_user
-                    row.queue_depth = self.ingest_q.qsize()
+                    from ..models import ProcessingJob
+                    row.queue_depth = s.query(ProcessingJob).filter(
+                        ProcessingJob.status.in_(("pending", "retry", "running"))).count()
                     row.started_at = self.started_at
             except Exception as e:
                 logger.debug("写心跳失败: %s", e)
@@ -231,16 +234,9 @@ class WorkerRunner:
             if cid is None:
                 return
             gid = getattr(event.message, "grouped_id", None)
-            if gid:
-                key = f"{chat_key}:{gid}"
-                self._albums.setdefault(key, []).append(event.message)
-                old = self._album_timers.get(key)
-                if old is not None and not old.done():
-                    old.cancel()
-                self._album_timers[key] = asyncio.create_task(
-                    self._flush_album_later(key, cid))
-                return
-            self._enqueue(cid, [event.message])
+            from ..jobs import save_events
+            await asyncio.to_thread(save_events, cid, [event.message],
+                                    delay=ALBUM_DEBOUNCE if gid else 0)
         except Exception as e:
             logger.exception("接收消息出错: %s", e)
 
@@ -255,39 +251,35 @@ class WorkerRunner:
             self._enqueue(cid, msgs)
 
     def _enqueue(self, cid: int, msgs: list) -> None:
-        try:
-            self.ingest_q.put_nowait((cid, msgs))
-        except asyncio.QueueFull:
-            logger.error("入库队列已满，丢弃 %d 条消息。翻译后端可能全挂了", len(msgs))
-            log_event("error", "worker", "入库队列已满，有消息被丢弃")
+        from ..jobs import save_events
+        save_events(cid, msgs)
 
-    async def _ingest_loop(self, idx: int) -> None:
+    async def _processing_loop(self, queue: str) -> None:
+        from .. import jobs
+        from .processing import HANDLERS, RetryLater
         while not self._exit.is_set():
             try:
-                cid, msgs = await asyncio.wait_for(self.ingest_q.get(), timeout=2.0)
-            except asyncio.TimeoutError:
-                continue
+                job = await asyncio.to_thread(jobs.claim, queue)
             except Exception:
+                logger.exception("领取 %s 队列失败", queue)
+                await asyncio.sleep(2)
                 continue
+            if not job:
+                await asyncio.sleep(0.5)
+                continue
+            heartbeat = asyncio.create_task(jobs.heartbeat(job))
             try:
-                if self.client is None:
-                    continue
-                mid = await pipeline.ingest(self.client, cid, msgs)
-                if mid:
-                    from .. import outputs
-                    await outputs.push_message(mid)
-                    # QQ 群推送。与 webhook 独立捕获：一边挂了不影响另一边
-                    from .. import qqbot
-                    try:
-                        await qqbot.push_message(mid)
-                    except Exception as e:
-                        logger.warning("QQ 推送失败（消息 %s）: %s", mid, e)
-                        log_event("warning", "qqbot", f"推送消息 {mid} 失败: {e}")
+                result = await HANDLERS[queue](self, job["payload"])
+                await asyncio.to_thread(jobs.finish, job, result)
+            except RetryLater as exc:
+                await asyncio.to_thread(jobs.finish, job, error=str(exc), retry_after=exc.seconds)
             except Exception as e:
-                logger.exception("处理消息失败: %s", e)
-                log_event("error", "pipeline", str(e)[:1000])
+                logger.exception("%s 任务失败: %s", queue, e)
+                await asyncio.to_thread(jobs.finish, job, error=str(e),
+                    retry_after=min(3600, 30 * job["attempts"]) if job["attempts"] < 10 else None)
             finally:
-                self.ingest_q.task_done()
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     # ---------------- 任务队列 ----------------
 
@@ -348,16 +340,7 @@ class WorkerRunner:
                 logger.warning("对齐循环出错: %s", e)
 
     async def _run_catchup_round(self, only_cid: int | None = None) -> None:
-        """一轮对齐：时间窗口语义。
-
-        旧逻辑按「落后条数」取舍（gap > MAX_GAP 放弃，提示手动补）——
-        爆料频道一天几十条，条数上限挡不住时间上的洞。新语义：
-        只保证「最近 ALIGN_WINDOW_DAYS 天」齐全，窗口外的老缺口不管。
-        补完把 last_tg_id 推进到 TG 侧最新（基线前移，不再回看）。
-
-        每轮挂一个 catchup_round Task 供概览页看进度；
-        only_cid 非空时只对齐这一个频道（频道页「对齐」按钮）。
-        """
+        """Reconcile recent edits and page through the whole recorded outage."""
         items = list(self.watchlist.items())
         if only_cid is not None:
             items = [(tg, cid) for tg, cid in items if cid == only_cid]
@@ -379,21 +362,52 @@ class WorkerRunner:
             tid = t.id
 
         def _progress(ch_idx: int, title: str, detail: str) -> None:
+            """进度回写 Task.result：汇总 + 分频道明细一起，一个写入点。
+
+            之前 _progress 和收尾各自写 result，后写的会盖掉先写的字段
+            （percent/detail 丢失）—— 统一成全量覆盖，谁写都带全字段。
+            """
             pct = int(ch_idx / len(items) * 100) if items else 0
             task_mod._set_action(
                 f"对齐 {title}（{ch_idx}/{len(items)}）{detail}")
+            _write_task_result(
+                {"done": ch_idx, "total": len(items),
+                 "aligned": aligned, "skipped": skipped,
+                 "current": title, "percent": pct, "detail": detail,
+                 "channels": chan_detail})
+
+        def _write_task_result(payload: dict, final: bool = False) -> None:
             try:
                 with session_scope() as s:
                     row = s.get(Task, tid)
-                    if row is not None and row.status in ("pending", "running"):
-                        row.status = "running"
-                        row.result = {"done": ch_idx, "total": len(items),
-                                      "current": title, "percent": pct,
-                                      "detail": detail}
+                    if row is None:
+                        return
+                    if final:
+                        row.status = "done"
+                        row.finished_at = datetime.utcnow()
+                    elif row.status not in ("pending", "running"):
+                        return
+                    row.result = payload
             except Exception:
                 pass
 
         done_idx, aligned, skipped = 0, 0, 0
+        # 分频道明细：频道页「上轮对齐」列与概览页健康度都读这个。
+        # {cid: {"title","status","gap","ingested","error"}} —— status:
+        # aligned(补了)/synced(已同步)/empty(空频道)/error
+        chan_detail: dict[int, dict] = {}
+
+        def _chan(cid, title, status, *, gap=None, ingested=None, error=None):
+            chan_detail[cid] = {"title": title, "status": status,
+                                "gap": gap, "ingested": ingested, "error": error}
+
+        def _flush_result(final: bool = False) -> None:
+            """当前汇总 + 分频道明细回写（percent 字段沿用最近一次进度）。"""
+            _write_task_result(
+                {"done": done_idx, "total": len(items),
+                 "aligned": aligned, "skipped": skipped,
+                 "channels": chan_detail}, final=final)
+
         try:
             for tg_id, cid in items:
                 if self._exit.is_set():
@@ -408,8 +422,8 @@ class WorkerRunner:
                         if ch is None or not ch.enabled:
                             continue
                         title = ch.title
-                        ch.last_tg_id = latest_id
-                        ch.last_catchup_at = datetime.utcnow()
+                        previous_sync = ch.last_catchup_at or ch.last_message_at
+                        channel_cutoff = min(min_date, previous_sync - timedelta(hours=1)) if previous_sync else min_date
                         # tg_message_id 是 VARCHAR：字典序会让 '999' > '1000'，
                         # 必须 CAST 成整数再取 max
                         db_max = (s.query(
@@ -417,39 +431,54 @@ class WorkerRunner:
                             .filter(MonitorMessage.channel_id == cid).scalar())
                     if latest_id is None:
                         skipped += 1
+                        _chan(cid, title, "empty")
                         _progress(done_idx, title, "空频道")
+                        _flush_result()
                         continue
                     gap = latest_id - (db_max or 0)
-                    if gap <= 0:
-                        skipped += 1
-                        _progress(done_idx, title, "已同步")
-                        continue
                     # 窗口内补拉：limit 封顶防单轮过载，
                     # min_date 让 iter 在碰到窗口外老消息时停下
-                    n = min(gap, max_gap)
+                    n = max_gap
                     _progress(done_idx, title, f"补 {gap} 条（拉 {n}）")
                     logger.info("对齐：%s 落后 %d 条，补窗口内最多 %d 条",
                                 title, gap, n)
                     r = await task_mod._iter_and_ingest(
                         self.client, cid, int(tg_id), limit=n,
-                        min_date=min_date)
+                        min_date=channel_cutoff, persistent_cursor=True)
+                    # Advance the cursor after the fetch and ingest complete;
+                    # a failed or interrupted batch remains visible next round.
+                    with session_scope() as s:
+                        ch = s.get(Channel, cid)
+                        if ch is not None:
+                            ch.last_tg_id = latest_id
+                            if r.get("complete"):
+                                ch.last_catchup_at = datetime.utcnow()
+                        from ..models import SourceCursor
+                        cursor = s.get(SourceCursor, cid)
+                        if cursor is not None:
+                            cursor.state = {"gap_after": db_max or 0, "gap_through": latest_id,
+                                            "complete": bool(r.get("complete"))}
                     aligned += 1
+                    ingested = int(r.get("ingested", 0) or 0)
+                    _chan(cid, title, "aligned", gap=gap, ingested=ingested)
                     _progress(done_idx, title,
-                              f"入库 {r.get('ingested', 0)} 条")
-                    if gap > max_gap:
+                              f"入库 {ingested} 条")
+                    _flush_result()
+                    if not r.get("complete"):
                         log_event("info", "catchup",
-                                  f"{title} 落后 {gap} 条，本轮只补了最近 "
-                                  f"{window_days} 天窗口内的；更早的不再回看")
+                                  f"{title} 已保存分页游标 {r.get('offset_id')}，下轮继续补拉")
                 except Exception as e:
                     logger.warning("对齐频道 %s 失败: %s", tg_id, e)
-            # 收尾：Task 标记完成
-            with session_scope() as s:
-                row = s.get(Task, tid)
-                if row is not None:
-                    row.status = "done"
-                    row.result = {"done": done_idx, "total": len(items),
-                                  "aligned": aligned, "skipped": skipped}
-                    row.finished_at = datetime.utcnow()
+                    try:
+                        with session_scope() as s:
+                            ch = s.get(Channel, cid)
+                            _chan(cid, ch.title if ch else str(tg_id), "error",
+                                  error=f"{type(e).__name__}: {e}"[:120])
+                    except Exception:
+                        pass
+                    _flush_result()
+            # 收尾：Task 标记完成（终值含分频道明细）
+            _flush_result(final=True)
         finally:
             task_mod._set_action("")
 
@@ -473,6 +502,7 @@ class WorkerRunner:
 
     async def run(self) -> None:
         from .maintenance import maintenance_loop
+        from .. import extension_runtime
         await self.ensure_client()
         jobs = [
             asyncio.create_task(self._heartbeat_loop()),
@@ -481,13 +511,15 @@ class WorkerRunner:
             asyncio.create_task(self._config_loop()),
             asyncio.create_task(self._catchup_loop()),
             asyncio.create_task(maintenance_loop(self._exit)),
+            asyncio.create_task(extension_runtime.poll_sources()),
         ]
-        for i in range(INGEST_WORKERS):
-            jobs.append(asyncio.create_task(self._ingest_loop(i)))
+        for queue in ("ingest", "source", "media", "media", "archive", "translate", "translate", "publish"):
+            jobs.append(asyncio.create_task(self._processing_loop(queue)))
         try:
             await self._exit.wait()
         finally:
             for j in jobs:
                 j.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
+            await extension_runtime.close()
             await self._teardown_client("退出")

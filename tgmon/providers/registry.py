@@ -9,6 +9,9 @@ import asyncio
 import logging
 import time
 from collections import deque
+from contextlib import asynccontextmanager
+import heapq
+import itertools
 from datetime import datetime
 
 from ..crypto import decrypt
@@ -28,8 +31,44 @@ PROTOCOLS: dict[str, type[BaseProvider]] = {
 # provider_id -> (并发上限, Semaphore, 最近调用时间戳队列)。按事件循环隔离。
 # 记住上限本身而不是看 Semaphore._value —— 后者是「剩余可用数」，会随占用变化，
 # 拿它判断配置有没有变会在高并发时误重建。
-_limiters: dict[int, tuple[int, asyncio.Semaphore, deque]] = {}
+_limiters: dict[int, tuple[int, object, deque]] = {}
 _limiter_loop: asyncio.AbstractEventLoop | None = None
+
+
+class PriorityLimiter:
+    def __init__(self, capacity: int):
+        self.available = capacity
+        self.waiters = []
+        self.order = itertools.count()
+
+    def release(self):
+        while self.waiters:
+            _, _, future = heapq.heappop(self.waiters)
+            if not future.done():
+                future.set_result(None)
+                return
+        self.available += 1
+
+    @asynccontextmanager
+    async def slot(self, priority: int):
+        future = None
+        if self.available:
+            self.available -= 1
+        else:
+            future = asyncio.get_running_loop().create_future()
+            heapq.heappush(self.waiters, (priority, next(self.order), future))
+            try:
+                await asyncio.shield(future)
+            except BaseException:
+                if future.done() and not future.cancelled():
+                    self.release()
+                else:
+                    future.cancel()
+                raise
+        try:
+            yield
+        finally:
+            self.release()
 
 
 def _row_to_cfg(row: AIProvider) -> ProviderConfig:
@@ -73,7 +112,7 @@ def build(cfg: ProviderConfig) -> BaseProvider:
     return impl(cfg)
 
 
-def _limiter(cfg: ProviderConfig) -> tuple[asyncio.Semaphore, deque]:
+def _limiter(cfg: ProviderConfig) -> tuple[PriorityLimiter, deque]:
     global _limiter_loop, _limiters
     loop = asyncio.get_running_loop()
     if _limiter_loop is not loop:
@@ -83,7 +122,7 @@ def _limiter(cfg: ProviderConfig) -> tuple[asyncio.Semaphore, deque]:
     if ent is None or ent[0] != cfg.concurrency:
         # 并发上限在界面上改了才重建。旧 Semaphore 上正在等待的调用会用旧上限
         # 跑完，这是可接受的 —— 下一批就走新值
-        ent = (cfg.concurrency, asyncio.Semaphore(cfg.concurrency), deque())
+        ent = (cfg.concurrency, PriorityLimiter(cfg.concurrency), deque())
         _limiters[cfg.id] = ent
     return ent[1], ent[2]
 
@@ -102,13 +141,19 @@ async def _acquire_rpm(calls: deque, rpm: int) -> None:
         await asyncio.sleep(max(0.05, 60 - (now - calls[0])))
 
 
-async def call_one(cfg: ProviderConfig, system: str, user: str) -> AIResult:
-    """单个 provider 调用，带并发上限与限流。"""
+async def call_one(cfg: ProviderConfig, system: str, user: str,
+                   **overrides) -> AIResult:
+    """单个 provider 调用，带并发上限与限流。
+
+    overrides 按调用阶段覆盖生成参数（如路由阶段 max_tokens=300），
+    键与 provider.complete 的 kwargs 一致，未传时用 provider 全局配置。
+    """
     sem, calls = _limiter(cfg)
-    async with sem:
+    priority = int(overrides.pop("_priority", 10))
+    async with sem.slot(priority):
         await _acquire_rpm(calls, cfg.rpm_limit)
         provider = build(cfg)
-        return await provider.complete(system, user)
+        return await provider.complete(system, user, **overrides)
 
 
 def record_stats(provider_id: int, ok: bool, error: str | None = None) -> None:
@@ -128,16 +173,34 @@ def record_stats(provider_id: int, ok: bool, error: str | None = None) -> None:
         logger.warning("写 provider 统计失败: %s", e)
 
 
-async def complete_with_failover(system: str, user: str) -> AIResult:
-    """按优先级走完整条链。返回最后一个结果（成功即提前返回）。"""
+async def complete_with_failover(system: str, user: str, **overrides) -> AIResult:
+    """按优先级走完整条链。返回最后一个结果（成功即提前返回）。
+
+    overrides 透传给每个 provider.complete（如路由阶段限 max_tokens）。
+    """
     configs = load_configs()
     if not configs:
         return AIResult(error="没有启用的翻译后端。去后台 Provider 页加一个")
 
+    from .. import settings
+    purpose = str(overrides.pop("purpose", "translate"))
+    deadline_seconds = overrides.pop("deadline_seconds", None)
+    if deadline_seconds is None:
+        deadline_seconds = settings.get(f"AI_{purpose.upper()}_DEADLINE") or 90
+    deadline = time.monotonic() + max(1, float(deadline_seconds))
+    preferences = (settings.get("AI_PURPOSE_PROVIDERS") or {}).get(purpose, [])
+    if preferences:
+        ranks = {name: index for index, name in enumerate(preferences)}
+        configs.sort(key=lambda cfg: ranks.get(cfg.name, len(ranks)))
     last = AIResult(error="未知错误")
-    for cfg in configs:
+    for index, cfg in enumerate(configs):
         try:
-            res = await call_one(cfg, system, user)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return AIResult(error=f"{purpose} deadline exceeded")
+            res = await asyncio.wait_for(call_one(cfg, system, user,
+                _priority=0 if purpose == "chat" else 20 if purpose == "summary" else 10, **overrides),
+                timeout=min(remaining / (len(configs) - index), float(cfg.timeout or remaining)))
         except Exception as e:  # 构造阶段就炸（协议名错等）
             res = AIResult(provider_name=cfg.name, model=cfg.model,
                            error=f"{type(e).__name__}: {e}")

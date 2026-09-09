@@ -185,7 +185,10 @@ async def _ai_summary(text: str, prompt: str) -> str | None:
         return None
     from ...providers import registry
     try:
-        res = await registry.complete_with_failover(prompt, text[:6000])
+        # 概括只要一句话：限 token 防长生成（这条调用发生在卡片首次打开的
+        # 浏览路径上，慢了会拖住页面并挤占 provider 并发位）
+        res = await registry.complete_with_failover(prompt, text[:6000],
+                                                    max_tokens=200, temperature=0.2)
     except Exception as e:
         logger.warning("AI 概括失败: %s", e)
         res = None
@@ -329,9 +332,11 @@ async def share_card(sid: int, request: Request, dl: str = "",
     _row, msgs, channels, media, summary, url = await _card_payload(sid, request)
     data = _card_items(msgs, channels, media)
     try:
-        pages = card.render_long_cards(data, summary=summary, url=url,
-                                       media_dir=MEDIA_DIR,
-                                       max_height=CARD_MAX_HEIGHT)
+        # PIL 渲染必须移出事件循环：同步跑会冻结整个 admin（桥事件/AI 全停），
+        # 多人看长图时机器人集体卡死就是这么来的
+        pages = await asyncio.to_thread(card.render_long_cards, data, summary=summary,
+                                        url=url, media_dir=MEDIA_DIR,
+                                        max_height=CARD_MAX_HEIGHT)
     except RuntimeError as e:
         return HTMLResponse(f"<span class='err'>{e}</span>", status_code=500)
     page = max(1, min(int(page or 1), len(pages)))
@@ -350,10 +355,10 @@ async def share_card_zip(sid: int, request: Request,
     """Download all pages of a long card as a ZIP archive."""
     _row, msgs, channels, media, summary, url = await _card_payload(sid, request)
     try:
-        pages = card.render_long_cards(_card_items(msgs, channels, media),
-                                       summary=summary, url=url,
-                                       media_dir=MEDIA_DIR,
-                                       max_height=CARD_MAX_HEIGHT)
+        pages = await asyncio.to_thread(
+            card.render_long_cards, _card_items(msgs, channels, media),
+            summary=summary, url=url, media_dir=MEDIA_DIR,
+            max_height=CARD_MAX_HEIGHT)
     except RuntimeError as e:
         return HTMLResponse(f"<span class='err'>{e}</span>", status_code=500)
     buf = io.BytesIO()
@@ -375,9 +380,10 @@ async def public_share_card(token: str, request: Request, dl: str = "",
     if row is None:
         raise HTTPException(404)
     _row, msgs, channels, media, summary, url = await _card_payload(row.id, request)
-    pages = card.render_long_cards(_card_items(msgs, channels, media), summary=summary,
-                                   url=url, media_dir=MEDIA_DIR,
-                                   max_height=CARD_MAX_HEIGHT)
+    pages = await asyncio.to_thread(
+        card.render_long_cards, _card_items(msgs, channels, media),
+        summary=summary, url=url, media_dir=MEDIA_DIR,
+        max_height=CARD_MAX_HEIGHT)
     page = max(1, min(int(page or 1), len(pages)))
     headers = {"X-Card-Pages": str(len(pages))}
     if dl == "1":
@@ -393,9 +399,10 @@ async def public_share_card_zip(token: str, request: Request):
     if row is None:
         raise HTTPException(404)
     _row, msgs, channels, media, summary, url = await _card_payload(row.id, request)
-    pages = card.render_long_cards(_card_items(msgs, channels, media), summary=summary,
-                                   url=url, media_dir=MEDIA_DIR,
-                                   max_height=CARD_MAX_HEIGHT)
+    pages = await asyncio.to_thread(
+        card.render_long_cards, _card_items(msgs, channels, media),
+        summary=summary, url=url, media_dir=MEDIA_DIR,
+        max_height=CARD_MAX_HEIGHT)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, payload in enumerate(pages, 1):

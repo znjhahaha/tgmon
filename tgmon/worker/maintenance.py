@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from .. import settings
 from ..db import engine, session_scope
-from ..models import MessageMedia, MonitorMessage, QqGroup, QqInbound, SystemEvent, Task
+from ..models import MessageMedia, MonitorMessage, SystemEvent, Task
 from ..paths import MEDIA_DIR, VIDEO_DIR
 from ..sharing import protected_message_ids
 
@@ -64,9 +64,14 @@ def _dir_usage(d, *, skip_private: bool = False) -> int:
 def _clear_video(r) -> int:
     """清掉一条记录的归档视频（不动缩略图）。返回释放的字节数。"""
     got = _unlink(VIDEO_DIR, r.video_path)
+    if r.original_path and r.original_path != r.video_path:
+        got += _unlink(VIDEO_DIR, r.original_path)
+    r.original_path, r.original_bytes = None, 0
     r.video_path = None
     r.video_bytes = 0
-    r.video_status = None
+    r.video_status = "expired"
+    if r.status != "superseded":
+        r.status = "expired"
     return got
 
 
@@ -75,6 +80,11 @@ def _clear_thumb(r) -> int:
     got = _unlink(MEDIA_DIR, r.thumb_path)
     r.thumb_path = None
     r.thumb_bytes = 0
+    if r.kind == "photo":
+        got += _unlink(VIDEO_DIR, r.original_path)
+        r.original_path, r.original_bytes = None, 0
+        if r.status != "superseded":
+            r.status = "expired"
     return got
 
 
@@ -219,12 +229,17 @@ def _cleanup_orphans() -> int:
                   .filter(MessageMedia.thumb_path.isnot(None)).all()}
         videos = {r[0] for r in s.query(MessageMedia.video_path)
                   .filter(MessageMedia.video_path.isnot(None)).all()}
+        videos.update(r[0] for r in s.query(MessageMedia.original_path)
+                      .filter(MessageMedia.original_path.isnot(None)))
     n = 0
     now_ts = datetime.utcnow().timestamp()
     for base, known in ((MEDIA_DIR, thumbs), (VIDEO_DIR, videos)):
         for p in base.rglob("*"):
             if not p.is_file():
                 continue
+            if ".partial" in p.name:
+                if now_ts - p.stat().st_mtime < 7 * 86400:
+                    continue
             if base == MEDIA_DIR and VIDEO_DIR in p.parents:
                 continue          # 视频目录单独扫
             rel = p.relative_to(base).as_posix()
@@ -324,78 +339,6 @@ def cleanup_disk_watermark() -> dict:
             "total_gb": round(total / 1024**3, 2)}
 
 
-async def daily_digest() -> None:
-    """每日召回摘要：给当天互动过的群发「近 24h 爆料汇总」。
-
-    走 is_wakeup 互动召回通道（主动消息已被平台下线）。官方文档对
-    召回的描述偏单聊场景，群聊是否放行要实测 —— 权限类错误码会
-    自动停用本功能（settings 开关），不影响其他能力。
-    """
-    if not settings.get("QQ_DAILY_DIGEST_ENABLED"):
-        return
-    if not settings.get("QQ_ENABLED"):
-        return
-    from sqlalchemy import func
-    from ..qqbot import client as qq_client
-    from ..qqbot.client import QqApiError
-
-    since = datetime.utcnow() - timedelta(hours=24)
-    # 汇总文本：游戏分布 + 每游戏最新一条
-    with session_scope() as s:
-        games = (s.query(MonitorMessage.game_detected, func.count())
-                 .filter(MonitorMessage.published_at >= since,
-                         MonitorMessage.game_detected.isnot(None))
-                 .group_by(MonitorMessage.game_detected)
-                 .order_by(func.count().desc()).limit(6).all())
-        if not games:
-            logger.info("每日摘要：近 24h 无消息，跳过")
-            return
-        lines = ["近 24 小时爆料汇总："]
-        for g, n in games:
-            top = (s.query(MonitorMessage)
-                   .filter(MonitorMessage.published_at >= since,
-                           MonitorMessage.game_detected == g)
-                   .order_by(MonitorMessage.published_at.desc())
-                   .first())
-            head = (top.text_zh or top.text_raw or "").strip() \
-                .replace("\n", " ")[:50]
-            lines.append(f"· {g}（{n} 条）：{head}")
-        text = "\n".join(lines)[:1700]
-        # 目标：当天有互动（QqInbound）的启用群。本地(Asia/Shanghai)今天
-        # 0 点 → UTC 起点，避开 date() 跨时区的坑
-        now_local = datetime.now()
-        today_start_utc = now_local.replace(
-            hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=8)
-        groups = [g.group_openid for g in s.query(QqGroup)
-                  .filter(QqGroup.enabled.is_(True)).all()
-                  if s.query(QqInbound)
-                  .filter(QqInbound.group_openid == g.group_openid,
-                          QqInbound.created_at >= today_start_utc)
-                  .count() > 0]
-    if not groups:
-        logger.info("每日摘要：今天没有群互动过，跳过（召回额度要求先互动）")
-        return
-    sent = 0
-    for openid in groups:
-        try:
-            await qq_client.send_group_text(openid, text, is_wakeup=True)
-            sent += 1
-        except QqApiError as e:
-            logger.warning("每日摘要发送失败 %s…: code=%s %s",
-                           openid[:8], e.code, e.message)
-            # 权限类错误（群聊召回不放行）→ 停用整个功能，明天不再试
-            if e.code in (40034105, 10000) or "wakeup" in str(e.message).lower():
-                settings.set_many({"QQ_DAILY_DIGEST_ENABLED": False})
-                from ..util import log_event
-                log_event("warning", "qqbot",
-                          "每日召回摘要被平台拒绝（群聊可能不支持 is_wakeup），"
-                          "已自动停用。管理页可重新开启。")
-                return
-        except Exception as e:
-            logger.warning("每日摘要异常 %s…: %s", openid[:8], e)
-    logger.info("每日摘要已发 %d 个群", sent)
-
-
 async def sync_wiki_sources() -> None:
     if not settings.get("WIKI_SYNC_ENABLED"):
         return
@@ -424,8 +367,6 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
     last_cleanup = 0.0
     # 启动即抓一次：worker 重启后不用等 20 分钟才知道有没有新版本
     last_changelog = -CHANGELOG_EVERY
-    # 每日召回摘要：记录上次发送的本地日期，跨 21:00 触发一次
-    last_digest_day = ""
     last_wiki_poll = -WIKI_EVERY
     loop = asyncio.get_running_loop()
     while not stop.is_set():
@@ -462,15 +403,6 @@ async def maintenance_loop(stop: asyncio.Event) -> None:
                     await summarize_all_pending()
                 except Exception as e:
                     logger.debug("QQ 记忆摘要失败: %s", e)
-            # 每日摘要：本地 21:00 后且今天没发过
-            now_local = datetime.now()
-            if (now_local.hour >= 21
-                    and now_local.strftime("%Y-%m-%d") != last_digest_day):
-                last_digest_day = now_local.strftime("%Y-%m-%d")
-                try:
-                    await daily_digest()
-                except Exception as e:
-                    logger.warning("每日摘要出错: %s", e)
             # 挂在维护循环里而不是 ingest：抓网站不需要 TG 客户端，
             # 账号没登录（need_credentials）时这条线也该照常跑
             if settings.get("CHANGELOG_ENABLED") and \

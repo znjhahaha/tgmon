@@ -16,6 +16,14 @@ def database():
     Base.metadata.create_all(engine)
     previous = settings.get("BASE_URL")
     settings.set_many({"BASE_URL": "https://example.com"})
+    # 多机器人时代：推送/投递路径要解析凭据，预置一个启用的机器人
+    from tgmon.crypto import encrypt
+    from tgmon.models import QqBot
+    with session_scope() as s:
+        if not s.query(QqBot.id).first():
+            s.add(QqBot(app_id="10001", nickname="测试机器人",
+                        app_secret_enc=encrypt("secret-10001")))
+    client.invalidate_token()
     qqbot_cb._REPLIED.clear()
     yield
     with session_scope() as s:
@@ -26,7 +34,9 @@ def database():
         s.query(MonitorMessage).filter(MonitorMessage.id == 996001).delete()
         s.query(Channel).filter(Channel.id == 996001).delete()
         s.query(QqGroup).filter(QqGroup.group_openid == "album-group").delete()
+        s.query(QqBot).delete()
     qqbot_cb._REPLIED.clear()
+    client.invalidate_token()
     settings.set_many({"BASE_URL": previous or ""})
 
 
@@ -114,7 +124,7 @@ async def test_album_upload_sends_one_complete_composite(album, monkeypatch):
     names, _ = album
     uploaded = []
 
-    async def upload(group, path, raise_fatal=False):
+    async def upload(group, path, raise_fatal=False, bot=None):
         uploaded.append(path)
         with Image.open(paths.MEDIA_DIR / path) as image:
             assert image.height > 500
@@ -129,7 +139,7 @@ async def test_album_upload_sends_one_complete_composite(album, monkeypatch):
 async def test_single_photo_keeps_existing_upload_path(monkeypatch):
     uploaded = []
 
-    async def upload(group, path, raise_fatal=False):
+    async def upload(group, path, raise_fatal=False, bot=None):
         uploaded.append((path, raise_fatal))
         return "single"
 
@@ -140,7 +150,9 @@ async def test_single_photo_keeps_existing_upload_path(monkeypatch):
 
 @pytest.mark.parametrize("command", ["/latest 1", "/game 原神 1", "/peek 996001", "/new"])
 @pytest.mark.asyncio
-async def test_commands_preserve_full_album_in_one_reply(command):
+async def test_commands_preserve_full_album_in_snapshot(command):
+    # 2026-09 超时复盘后：命令先回分享链接（长图后台补发），
+    # 整组图不拆条 —— 完整性由快照保证（一图流合集卡片渲染它）
     names = [f"image-{i}.webp" for i in range(10)]
     with session_scope() as s:
         s.add(Channel(id=996001, title="album", game="原神", tg_id="qq-album-test"))
@@ -148,14 +160,14 @@ async def test_commands_preserve_full_album_in_one_reply(command):
                              text_raw="完整正文", game_detected="原神", published_at=datetime.utcnow()))
         s.add_all([MessageMedia(message_id=996001, kind="photo", thumb_path=name) for name in names])
     replies = await commands._dispatch(command, "album-group", True)
-    images = [r for r in replies if r.kind == "image"]
-    assert len(images) == 1
+    assert len(replies) == 1
+    assert replies[0].bundle_id
     from tgmon.models import ShareToken
     with session_scope() as s:
-        snapshot = s.get(ShareToken, images[0].bundle_id).snapshot_items
+        snapshot = s.get(ShareToken, replies[0].bundle_id).snapshot_items
         assert snapshot[0]["photos"] == names
         assert snapshot[0]["text"] == "完整正文"
-    assert images[0].text.startswith("https://example.com/s/")
+    assert "https://example.com/s/" in replies[0].text
     assert "完整正文" not in commands.replies_text(replies)
 
 
@@ -164,12 +176,12 @@ async def test_passive_album_caption_and_images_are_one_api_message(album, monke
     names, _ = album
     posted = []
 
-    async def upload(group, path, raise_fatal=False):
+    async def upload(group, path, raise_fatal=False, bot=None):
         with Image.open(paths.MEDIA_DIR / path) as image:
             assert image.height > 500
         return "combined"
 
-    async def post(path, body):
+    async def post(path, body, bot=None):
         posted.append(body)
         return "sent"
 
@@ -190,10 +202,10 @@ async def test_push_album_counts_as_one_daily_message(album, monkeypatch):
     names, _ = album
     posted = []
 
-    async def upload(group, path, raise_fatal=False):
+    async def upload(group, path, raise_fatal=False, bot=None):
         return "album"
 
-    async def post(path, body):
+    async def post(path, body, bot=None):
         posted.append(body)
         return "sent"
 

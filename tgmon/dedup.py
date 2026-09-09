@@ -95,3 +95,20 @@ def hamming_hex(a: str | None, b: str | None) -> int:
         return bin(int(a, 16) ^ int(b, 16)).count("1")
     except ValueError:
         return 999
+
+
+def informative(h: str | None) -> bool:
+    """指纹是否有区分度：1 的个数在 [3, 61]（64 位）。
+
+    近纯色缩略图（视频黑首帧 / 纯色图 / 大黑边截图）会算出全零或近零
+    哈希 —— 任意两个这种指纹的汉明距离只有 0-2，判重条件轻松满足。
+    2026-09 案例：242 秒的预告片和 35 秒的过场动画都是黑首帧，dhash
+    距离 1，被误判成同一视频。这类指纹不参与图片判重。
+    """
+    if not h:
+        return False
+    try:
+        n = bin(int(h, 16)).count("1")
+    except ValueError:
+        return False
+    return 3 <= n <= 61

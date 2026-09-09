@@ -11,6 +11,7 @@ from ...models import (
     AiUsage, Channel, MessageMedia, MonitorMessage, SystemEvent, Task,
 )
 from ...paths import MEDIA_DIR
+from ...settings import get as _cfg_get
 from ...util import local_day
 from ..deps import (
     format_task_view, get_task, render, require_admin, require_admin_api,
@@ -95,7 +96,47 @@ def _stats() -> dict:
         "recent_events": recent_events,
         "active_tasks": _active_tasks(),
         "latest_task": _latest_task(),
+        "channel_health": _channel_health(),
+        "catchup_every": max(60, int(_cfg_get("CATCHUP_INTERVAL") or 300)),
+        "last_catchup_at": _last_catchup_at(),
     }
+
+
+def _channel_health() -> list[dict]:
+    """启用的 telegram 频道拉取健康度（概览页卡片）。
+
+    每频道：最新消息时间（距今多久 = 频道活跃度）+ 落后条数
+    （TG 侧见到的最新 ID - 已入库最新 ID）。按最新消息倒序，最多 10 个。
+    """
+    from sqlalchemy import Integer, cast
+    with session_scope() as s:
+        maxes = dict(s.query(
+            MonitorMessage.channel_id,
+            func.max(cast(MonitorMessage.tg_message_id, Integer)))
+            .group_by(MonitorMessage.channel_id).all())
+        chans = (s.query(Channel)
+                 .filter(Channel.enabled.is_(True),
+                         Channel.source_type == "telegram")
+                 .order_by(Channel.last_message_at.desc().nullslast())
+                 .limit(10).all())
+        out = []
+        for c in chans:
+            gap = None
+            if c.last_tg_id is not None:
+                mx = maxes.get(c.id)
+                gap = c.last_tg_id - (mx or 0)
+            out.append({"id": c.id, "title": c.title,
+                        "last_message_at": c.last_message_at, "gap": gap})
+        return out
+
+
+def _last_catchup_at():
+    """最近一轮对齐的时间（概览页「上次对齐」展示）。"""
+    with session_scope() as s:
+        t = (s.query(Task)
+             .filter(Task.kind == "catchup_round")
+             .order_by(Task.id.desc()).first())
+        return (t.finished_at or t.created_at) if t is not None else None
 
 
 @router.get("/")

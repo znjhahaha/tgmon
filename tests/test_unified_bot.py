@@ -2,6 +2,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncio
+
 import pytest
 
 from tgmon import memory, settings
@@ -60,7 +62,9 @@ def test_one_turn_is_not_repeated_or_shared_across_groups(state):
 async def test_router_receives_real_recent_context(state, monkeypatch):
     from tgmon.providers import registry
     memory.record_turn("uni-g", "uni-a", "user", "context-marker")
-    complete = AsyncMock(return_value=SimpleNamespace(ok=True, text='{"action":"chat","reply":"ok"}'))
+    complete = AsyncMock(return_value=SimpleNamespace(
+        ok=True, text='{"action":"chat","reply":"ok"}',
+        provider_name="test", tokens_in=0, tokens_out=0))
     monkeypatch.setattr(registry, "complete_with_failover", complete)
     await agent.handle("continue", "uni-g", True, "uni-a")
     assert "context-marker" in str(complete.call_args)
@@ -136,11 +140,51 @@ def test_translation_policy_covers_unknown_names():
 async def test_latest_returns_a_snapshot_card_and_link(state):
     from tgmon.models import ShareToken
     replies = await commands._dispatch("/latest 3", "uni-g", True, "uni-a")
-    assert replies[0].kind == "image"
-    assert replies[0].text.startswith("https://example.com/s/")
+    # 2026-09 超时复盘后：先回链接（长图后台补发），守卫内不再渲染
+    assert len(replies) == 1
+    assert replies[0].kind == "text"
+    assert "https://example.com/s/" in replies[0].text
     with session_scope() as s:
         share = s.query(ShareToken).filter_by(created_by="qqbot").one()
         assert [x["id"] for x in share.snapshot_items] == [99001]
+        assert share.id == replies[0].bundle_id
+
+
+@pytest.mark.asyncio
+async def test_latest_link_first_then_background_cards(state, monkeypatch):
+    """链接先回（<25s 守卫内），长图渲染 + 补发在后台任务里做。"""
+    import tgmon.qqbot.commands as commands_mod
+    from tgmon.qqbot import sending
+
+    rendered = []
+    sent = []
+
+    def _fake_bundle_cards(sid):
+        rendered.append(sid)
+        return [f"page-{i}.jpg" for i in range(3)], "https://example.com/s/x", []
+
+    async def _fake_send(target, replies, *, key, private=False, msg_id=None, bot=None,
+                         seq_start=1):
+        sent.append((target, key, [r.kind for r in replies], msg_id, private, seq_start))
+
+    monkeypatch.setattr("tgmon.sharing.bundle_cards", _fake_bundle_cards)
+    monkeypatch.setattr(sending, "send_parts", _fake_send)
+    replies = await commands._dispatch("/latest 3", "uni-g", True, "uni-a",
+                                       msg_id="mid-bg-1")
+    # 守卫内只回链接，渲染还没发生
+    assert len(replies) == 1 and replies[0].kind == "text"
+    assert "https://example.com/s/" in replies[0].text
+    assert not rendered
+    # 后台任务跑完：渲染一次，图片按 3 页补发（独立 key、带原 msg_id）
+    await asyncio.sleep(0.2)
+    assert rendered
+    assert len(sent) == 1
+    target, key, kinds, msg_id, private, seq_start = sent[0]
+    assert target == "uni-g" and msg_id == "mid-bg-1" and private is False
+    assert kinds == ["image", "image", "image"]
+    # seq 从 2 开始：首条链接文本已占 seq=1，重开会被平台去重丢图
+    assert seq_start == 2
+    assert key != ""
 
 
 @pytest.mark.asyncio
@@ -193,6 +237,95 @@ async def test_five_requested_stories_survive_routing_and_card_packaging(state, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("count,expected", [(6, 6), (10, 10), ("六", 6), ("十", 10)])
+async def test_latest_serves_six_to_ten_stories(state, monkeypatch, count, expected):
+    """上限提到 10（2026-09）：6-10 条不再被静默截到 5。"""
+    with session_scope() as s:
+        for i in range(12):
+            if s.get(MonitorMessage, 99300 + i):
+                continue
+            s.add(MonitorMessage(id=99300 + i, channel_id=99001,
+                tg_message_id=str(300 + i), text_raw=f"count story {i}",
+                game_detected=normalize_game("HSR"),
+                published_at=datetime.utcnow() + timedelta(seconds=i)))
+    replies = await commands._dispatch(f"/latest {count}", "uni-g", True, "uni-a")
+    from tgmon.models import ShareToken
+    with session_scope() as s:
+        share = s.query(ShareToken).filter_by(created_by="qqbot").order_by(ShareToken.id.desc()).first()
+        assert len(share.snapshot_items) == expected
+        assert share.id == replies[0].bundle_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance", ["/latest 11", "/game 原神 11", "最近11条爆料",
+                                       "最进12条爆料", "再来 20 条"])
+async def test_latest_over_limit_reports_clearly(state, utterance):
+    """超过 10 条明确报错（2026-09：不再静默截断）。"""
+    # “再来 20 条”需要先有一次查询建立游标
+    await commands._dispatch("/latest 3", "uni-g", True, "uni-a")
+    replies = await commands._dispatch(utterance, "uni-g", True, "uni-a")
+    text = commands.replies_text(replies)
+    assert "最多 10 条" in text
+    assert "继续" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance,game,expected", [
+    ("查看最近的10-20条就是倒数", "崩坏:星穹铁道", 10),   # 区间取小值 + 口语填充
+    ("查看关于zzz的10条爆料", "绝区零", 10),              # 「查看…」不再被 peek 截胡
+    ("查看绝区零的10条baoliao", "绝区零", 10),            # 拼音爆料写法
+])
+async def test_view_latest_phrases_route_to_latest(state, monkeypatch, utterance, game, expected):
+    """2026-09 群实录：「查看…」类最新爆料请求曾全被 /peek 截胡。"""
+    route = AsyncMock(side_effect=AssertionError("view-latest phrases need no AI routing"))
+    monkeypatch.setattr(agent, "handle", route)
+    with session_scope() as s:
+        wanted = normalize_game(game)
+        for i in range(12):
+            mid = 99400 + i
+            if s.get(MonitorMessage, mid):
+                continue
+            s.add(MonitorMessage(id=mid, channel_id=99001,
+                tg_message_id=str(400 + i), text_raw=f"view story {i}",
+                game_detected=wanted,
+                published_at=datetime.utcnow() + timedelta(seconds=i)))
+    replies = await commands._dispatch(utterance, "uni-g", True, "uni-a")
+    from tgmon.models import ShareToken
+    with session_scope() as s:
+        share = s.query(ShareToken).filter_by(created_by="qqbot").order_by(ShareToken.id.desc()).first()
+        items = share.snapshot_items
+        assert len(items) == expected
+        assert all(i["game"] == game for i in items)
+    route.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_peek_requires_explicit_id(state):
+    """「查看 995001」仍走 peek；「查看最新…」不再误触。"""
+    replies = await commands._dispatch("查看 995001", "uni-g", True, "uni-a")
+    assert any("用法" in r.text or "没有" in r.text for r in replies) or replies
+
+
+@pytest.mark.asyncio
+async def test_text_mode_ten_stories_are_packed_not_truncated(state):
+    """文字版 10 条：按 MAX_TEXT 打包，总量不丢。"""
+    with session_scope() as s:
+        for i in range(12):
+            if s.get(MonitorMessage, 99300 + i):
+                continue
+            s.add(MonitorMessage(id=99300 + i, channel_id=99001,
+                tg_message_id=str(300 + i), text_raw=f"count story {i}",
+                game_detected=normalize_game("HSR"),
+                published_at=datetime.utcnow() + timedelta(seconds=i)))
+    replies = await commands._dispatch("/latest 10 文字版", "uni-g", True, "uni-a")
+    assert 1 <= len(replies) <= commands.MAX_REPLIES
+    total_ids = {mid for r in replies for mid in r.story_ids}
+    assert len(total_ids) == 10
+    for r in replies:
+        assert len(r.text) <= commands.MAX_TEXT
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("content", [
     "翻译：HSR latest leaks", "/translate [崩铁] Latest news", "/search 原神爆料",
     "我最近心情不好", "原神爆料为什么有冲突", "崩铁最新技能有什么变化",
@@ -218,8 +351,10 @@ async def test_continue_keeps_five_and_text_mode_keeps_the_same_results(state):
     assert ids(first) == set(range(99207, 99212))
     assert ids(second) == set(range(99202, 99207))
     text = await commands._dispatch("改成文字版", "uni-g", True, "uni-a")
-    assert len(text) == 5
+    # 2026-09 打包语义：多条聚合按 MAX_TEXT 切分，内容与编号不丢
+    assert 1 <= len(text) <= commands.MAX_REPLIES
     assert all(reply.kind == "text" for reply in text)
+    assert ids(text) == ids(second)
     assert all(any(f"#{mid}" in reply.text for reply in text) for mid in ids(second))
 
 

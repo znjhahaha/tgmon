@@ -2,6 +2,14 @@
 {% block title %}Provider · tgmon{% endblock %}
 {% block body %}
 <h1>Provider 管理</h1>
+<h2>模型用途</h2>
+<form method="post" action="/providers/purposes">
+  {% for key, label, deadline, chain in purposes %}
+  <div class="inline"><label>{{ label }}后端顺序<input name="{{ key }}" value="{{ chain }}"></label>
+    <label>总截止时间（秒）<input name="{{ key }}_deadline" type="number" min="1" max="300" value="{{ deadline }}"></label></div>
+  {% endfor %}
+  <button class="btn">保存</button>
+</form>
 <p class="sub">
   按协议而非厂商建模，加新后端只是在这儿填一行。<code>base_url</code> 必填、无默认值。
 </p>

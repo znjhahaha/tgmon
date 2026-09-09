@@ -85,7 +85,8 @@ def _row_view(r, media) -> dict:
             "has_spoiler": m.has_spoiler,
             "video_status": m.video_status, "video_path": m.video_path,
             "video_bytes": m.video_bytes,
-        } for m in media],
+            "status": m.status, "error": m.error,
+        } for m in media if m.status != "superseded"],
     }
 
 
@@ -101,10 +102,11 @@ def _load(page: int, channel_id: int | None, q: str, dup: str,
                 .offset(offset).limit(PAGE_SIZE).all())
         chan_names = {c.id: c.title for c in s.query(Channel).all()}
         out = []
-        for r in rows:
-            media = (s.query(MessageMedia)
-                     .filter(MessageMedia.message_id == r.id).all())
-            v = _row_view(r, media)
+        from ...message_query import project_many
+        views = project_many(s, rows)
+        for r, view in zip(rows, views):
+            v = _row_view(r, [])
+            v["media"] = view["media"]
             v["channel"] = chan_names.get(r.channel_id, "?")
             out.append(v)
         channels = [{"id": c.id, "title": c.title}
@@ -139,13 +141,15 @@ def _load(page: int, channel_id: int | None, q: str, dup: str,
 
 @router.get("")
 async def page_view(request: Request, page: str = "1",
-                    channel_id: str = "", q: str = "", dup: str = "hide",
+                    channel_id: str = "", q: str = "", dup: str = "",
                     status: str = "", topic: str = "", version: str = "",
                     game: str = "",
                     user: str = Depends(require_login),
                     _rl: None = Depends(guest_rate_limit)):
     # page/channel_id 用 str 接收再 opt_int：空串（表单「全部」选项）会 422
-    # dup 默认 hide：重复消息不进主列表（2026-09 反馈），专门界面在 /dedupe
+    # dup 默认空串 = 全部显示（2026-09 反馈：默认「只看首发」把跨频道内容
+    # 藏没了 —— 用户在 TG 看到的消息网站上找不到、图片视频"消失"）。
+    # 「只看首发」仍是筛选项，要刷屏小的自己切。
     pg = max(1, opt_int(page) or 1)
     cid = opt_int(channel_id)
     data = _load(pg, cid, q, dup, status, topic, version, game)
@@ -159,13 +163,14 @@ async def page_view(request: Request, page: str = "1",
 
 @router.get("/select-ids")
 async def select_ids(request: Request, channel_id: str = "", q: str = "",
-                     dup: str = "hide", status: str = "", topic: str = "",
+                     dup: str = "", status: str = "", topic: str = "",
                      version: str = "", game: str = "",
                      user: str = Depends(require_admin)):
     """Return at most 50 ids matching the current message filters.
 
     The endpoint deliberately returns only identifiers, allowing the browser to
     keep a cross-page selection without moving message content into JavaScript.
+    dup 默认与列表页一致（全部显示）。
     """
     cid = opt_int(channel_id)
     with session_scope() as s:

@@ -1,8 +1,4 @@
-"""抓取管线：去重 → 媒体 → 翻译 → 入库 → 出站。
-
-顺序是有意的：去重在翻译之前，重复消息直接复用首条的译文，不重复花钱。
-媒体处理在翻译之前，因为 pHash 判重要用缩略图，而判重结果决定是否翻译。
-"""
+"""Normalize source events and persist content before independent processing."""
 from __future__ import annotations
 
 import asyncio
@@ -49,6 +45,7 @@ class ChannelSnapshot:
     bilingual_policy: str = "zh_first"
     keep_video: bool = False
     video_max_mb: int = 0
+    theme: str = "gaming"
 
 
 def deeplink_for(channel: ChannelSnapshot, msg_id: int | str) -> str:
@@ -100,7 +97,9 @@ def _find_album_anchor(channel_id: int, grouped_id: str) -> int | None:
 
 
 def _attach_to_anchor(s, anchor: MonitorMessage, text_raw: str,
-                      result, media_outs: list, translate: bool) -> bool:
+                      result, media_outs: list, translate: bool,
+                      archive_channel: ChannelSnapshot | None = None,
+                      replace_snapshot: bool = False) -> bool:
     """把后续批次的媒体/文本并进 anchor。在已开的写事务里调用。
 
     媒体按 thumb_path 去重（缩略图文件名 = tg 消息 id，天然幂等）；
@@ -108,21 +107,46 @@ def _attach_to_anchor(s, anchor: MonitorMessage, text_raw: str,
     """
     changed = False
     existing = {x.thumb_path for x in anchor.media if x.thumb_path}
+    current_media = [x for x in anchor.media if x.status != "superseded"]
+    source_ids = {x.source_tg_id: x for x in current_media if x.source_tg_id}
+    incoming = {str(o.source_message_id) for o in media_outs if o.source_message_id}
+    if replace_snapshot:
+        for old in current_media:
+            if old.source_tg_id and old.source_tg_id not in incoming:
+                old.status = "superseded"
+                changed = True
     for o in media_outs:
+        old = source_ids.get(str(o.source_message_id))
+        if old:
+            if old.source_identity == o.source_identity:
+                continue
+            old.status = "superseded"
+            changed = True
         if o.thumb_path and o.thumb_path in existing:
             continue
-        s.add(MessageMedia(
+        media_row = MessageMedia(
             message_id=anchor.id, kind=o.kind, thumb_path=o.thumb_path,
+            source_tg_id=str(o.source_message_id) if o.source_message_id else None,
+            source_identity=o.source_identity, status=o.status, error=o.error,
+            original_path=o.original_path, original_bytes=o.original_bytes, sha256=o.sha256,
             thumb_bytes=o.thumb_bytes, width=o.width, height=o.height,
             duration=o.duration, orig_bytes=o.orig_bytes, mime=o.mime,
             phash=o.phash, dhash=o.dhash, video_path=o.video_path,
             video_bytes=o.video_bytes, video_status=o.video_status,
             has_spoiler=o.has_spoiler,
-        ))
+        )
+        s.add(media_row)
+        if archive_channel is not None and (o.status == "queued" or o.video_status == "queued"):
+            s.flush()
+            _queue_media(s, archive_channel.id, media_row,
+                         o.source_message_id or anchor.tg_message_id)
         existing.add(o.thumb_path)
+        if o.source_message_id:
+            source_ids[str(o.source_message_id)] = media_row
         changed = True
         anchor.has_media = True
-    if text_raw and not (anchor.text_raw or "").strip():
+    if ((text_raw and not (anchor.text_raw or "").strip()) or
+            (replace_snapshot and text_raw != (anchor.text_raw or ""))):
         anchor.text_raw = text_raw
         norm = dedup.normalize(text_raw)
         anchor.text_hash = dedup.text_hash(norm) if norm else None
@@ -140,9 +164,24 @@ def _attach_to_anchor(s, anchor: MonitorMessage, text_raw: str,
             anchor.cost = result.cost
             anchor.from_cache = result.from_cache
         else:
-            anchor.translate_status = "pending" if translate else "disabled"
+            anchor.text_zh = None
+            anchor.translate_status = "pending" if translate and text_raw else "disabled"
+        anchor.translate_error = None
         changed = True
+    if changed:
+        anchor.duplicate_of, anchor.dup_reason = None, None
+        s.flush()
+        s.expire(anchor, ["media"])
+        anchor.has_media = any(x.status != "superseded" for x in anchor.media)
+        from .content import record
+        record(anchor.id, session=s)
     return changed
+
+
+def _queue_media(s, channel_id, media_row, source_id):
+    from .jobs import enqueue
+    enqueue("media", f"media:{media_row.id}", {"channel_id": channel_id,
+        "media_id": media_row.id, "tg_message_id": str(source_id)}, session=s)
 
 
 def _submit_retranslate(s, message_id: int) -> None:
@@ -157,19 +196,27 @@ def _submit_retranslate(s, message_id: int) -> None:
 
 
 async def _merge_album(channel, anchor_id: int, messages: list,
-                       text_raw: str, media_outs: list) -> None:
+                       text_raw: str, media_outs: list, *, replace_snapshot=False,
+                       deferred=False) -> None:
     """相册后续批次并入 anchor：不新建记录、不重推（返回 None 语义）。"""
     gid = str(getattr(messages[0], "grouped_id", "") or "")
     changed = False
     with session_scope() as s:
-        anchor = s.execute(
-            _album_anchor_q(s, channel.id, gid)).scalar_one_or_none()
+        anchor = s.get(MonitorMessage, anchor_id)
         if anchor is None:
             return          # anchor 被清理（TTL）—— 本批放弃，宁缺毋滥
         changed = _attach_to_anchor(s, anchor, text_raw, None, media_outs,
-                                    channel.translate)
+                                    channel.translate, archive_channel=channel,
+                                    replace_snapshot=replace_snapshot)
         if changed and anchor.translate_status == "pending":
-            _submit_retranslate(s, anchor.id)
+            if deferred:
+                from .jobs import enqueue
+                import hashlib
+                revision = hashlib.sha256(text_raw.encode()).hexdigest()
+                enqueue("translate", f"translate:{anchor.id}:{revision}",
+                        {"message_id": anchor.id}, session=s)
+            else:
+                _submit_retranslate(s, anchor.id)
         anchor_id = anchor.id
     if changed:
         logger.info("相册合并：批次 %s 并入消息 #%s",
@@ -220,6 +267,10 @@ def _find_image_dup(fingerprints: list[tuple[str | None, str | None]]) -> tuple[
     不同截图上的误判为 0，所以这是纯赚的召回率。
 
     注意：裁剪与加边框两者都抓不到（距离 11-29），这是感知哈希的固有局限。
+
+    无区分度指纹（全零/近零，视频黑首帧等）不参与距离计算 —— 2026-09 案例：
+    黑首帧的 242s 预告片和 35s 过场动画 dhash 距离 1 被误判成同一视频。
+    一边无效就只用另一边，两边都无效不判重。
     """
     if not settings.get("DEDUP_ENABLED") or not fingerprints:
         return None
@@ -231,17 +282,46 @@ def _find_image_dup(fingerprints: list[tuple[str | None, str | None]]) -> tuple[
         cands = s.execute(
             select(MessageMedia.message_id, MessageMedia.phash, MessageMedia.dhash)
             .join(MonitorMessage, MonitorMessage.id == MessageMedia.message_id)
-            .where(MessageMedia.phash.isnot(None),
+            .where((MessageMedia.phash.isnot(None) | MessageMedia.dhash.isnot(None)),
                    MonitorMessage.duplicate_of.is_(None),
                    MonitorMessage.published_at >= since)
             .order_by(MessageMedia.id.asc()).limit(5000)
         ).all()
+
+    # A message is a duplicate only when its complete fingerprint set matches
+    # one existing message.  Matching one image from a larger album would hide
+    # the remaining new images (the production data-loss bug).
+    grouped: dict[int, list[tuple[str | None, str | None]]] = {}
     for mid, cand_p, cand_d in cands:
-        for ph, dh in fingerprints:
-            dist = min(dedup.hamming_hex(ph, cand_p),
-                       dedup.hamming_hex(dh, cand_d))
-            if dist <= max_dist:
-                return int(mid), "phash"
+        grouped.setdefault(int(mid), []).append((cand_p, cand_d))
+    incoming = [(p, d) for p, d in fingerprints
+                if dedup.informative(p) or dedup.informative(d)]
+    if not incoming:
+        return None
+    for mid, existing in grouped.items():
+        existing = [(p, d) for p, d in existing
+                    if dedup.informative(p) or dedup.informative(d)]
+        if len(existing) != len(incoming):
+            continue
+        remaining = list(existing)
+        matched = True
+        for ph, dh in incoming:
+            found = None
+            for i, (cand_p, cand_d) in enumerate(remaining):
+                dists = []
+                if dedup.informative(ph) and dedup.informative(cand_p):
+                    dists.append(dedup.hamming_hex(ph, cand_p))
+                if dedup.informative(dh) and dedup.informative(cand_d):
+                    dists.append(dedup.hamming_hex(dh, cand_d))
+                if dists and min(dists) <= max_dist and max(dists) <= 15:
+                    found = i
+                    break
+            if found is None:
+                matched = False
+                break
+            remaining.pop(found)
+        if matched and not remaining:
+            return mid, "phash"
     return None
 
 
@@ -288,17 +368,18 @@ def _spoiler_ranges(text_msg, text: str) -> list[list[int]]:
 
 
 async def _process_media(client, channel: ChannelSnapshot,
-                         messages: list) -> list:
+                         messages: list, *, deferred: bool = False) -> list:
     """批内媒体处理（频道过滤 + 大小上限）。主路径与相册合并共用。"""
     media_outs = []
     for m in messages:
         if not getattr(m, "media", None):
             continue
         try:
-            out = await media_mod.process(
+            out = media_mod.describe(m) if deferred else await media_mod.process(
                 client, m, channel.id,
                 keep_video=channel.keep_video,
-                video_max_mb=channel.video_max_mb)
+                video_max_mb=channel.video_max_mb,
+                defer_archive=True)
         except Exception as e:
             logger.warning("处理媒体失败 msg=%s: %s", m.id, e)
             log_event("warning", "media", f"{channel.title} msg {m.id}: {e}")
@@ -313,13 +394,15 @@ async def _process_media(client, channel: ChannelSnapshot,
             continue
         limit_mb = channel.max_media_mb or 0
         if limit_mb and out.orig_bytes > limit_mb * 1024 * 1024:
-            logger.info("媒体超限跳过 %s (%s MB)", m.id, out.orig_bytes // 1048576)
-            continue
+            out.status, out.error = "blocked_size", f"源文件超过频道 {limit_mb} MB 限制"
+            if out.kind == "video":
+                out.video_status = "skipped_size"
         media_outs.append(out)
     return media_outs
 
 
-async def ingest(client, channel_row_id: int, messages: list) -> int | None:
+async def ingest(client, channel_row_id: int, messages: list, *, deferred: bool = False,
+                 complete_snapshot: bool = False) -> int | None:
     """处理一条消息（相册为一组）。返回入库的 message id，跳过时返回 None。"""
     if not messages:
         return None
@@ -340,6 +423,7 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
             allow_document=ch.allow_document, max_media_mb=ch.max_media_mb,
             bilingual_policy=ch.bilingual_policy or "zh_first",
             keep_video=ch.keep_video, video_max_mb=ch.video_max_mb or 0)
+        channel.theme = ch.theme or "gaming"
 
     # ---------- 相册合并（第 1.5 层，读侧预检） ----------
     # 同 grouped_id 已有记录 → 后续批次并入 anchor，不再新建。
@@ -348,13 +432,22 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
     if gid:
         anchor_id = _find_album_anchor(channel.id, gid)
         if anchor_id is not None:
-            media_outs = await _process_media(client, channel, messages)
+            media_outs = await _process_media(client, channel, messages, deferred=deferred)
             text_raw, _ = _extract_text(messages)
             await _merge_album(channel, anchor_id, messages, text_raw,
-                               media_outs)
+                               media_outs, replace_snapshot=complete_snapshot,
+                               deferred=deferred)
             return None
 
     if already_ingested(channel.id, first.id):
+        if complete_snapshot or getattr(first, "edit_date", None):
+            with session_scope() as s:
+                anchor_id = s.query(MonitorMessage.id).filter_by(
+                    channel_id=channel.id, tg_message_id=str(first.id)).scalar()
+            media_outs = await _process_media(client, channel, messages, deferred=deferred)
+            text_raw, _ = _extract_text(messages)
+            await _merge_album(channel, anchor_id, messages, text_raw, media_outs,
+                               replace_snapshot=True, deferred=deferred)
         return None
 
     text_raw, text_msg = _extract_text(messages)
@@ -366,13 +459,32 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
     dup: tuple[int, str] | None = None
     if t_hash and len(norm) >= min_len:
         dup = _find_text_dup(t_hash, sim, channel.id)
+        if dup is not None and dup[1] != "text_exact":
+            logger.info("文本相似候选 #%s，保留原文和独立译文", dup[0])
+            dup = None
+        if dup:
+            with session_scope() as s:
+                old = s.get(MonitorMessage, dup[0])
+                if old is None or old.text_raw != text_raw or old.theme != channel.theme:
+                    dup = None
 
     # ---------- 媒体 ----------
-    media_outs = await _process_media(client, channel, messages)
+    media_outs = await _process_media(client, channel, messages, deferred=deferred)
+    if dup is not None and media_outs:
+        # Equal captions are common across a sequence of new images/videos.
+        # Until complete file identities prove equality, preserve this story.
+        logger.info("同文消息 #%s 带独立媒体，保留为新内容", dup[0])
+        dup = None
 
     if dup is None:
-        fps = [(o.phash, o.dhash) for o in media_outs if o.phash or o.dhash]
-        dup = _find_image_dup(fps)
+        # Image hashes are useful for related-story candidates, but a visual
+        # similarity alone must not hide a new story or discard its caption.
+        # Text/album identity remains the only automatic duplicate decision.
+        fps = [(o.phash, o.dhash) for o in media_outs
+               if dedup.informative(o.phash) or dedup.informative(o.dhash)]
+        image_candidate = _find_image_dup(fps)
+        if image_candidate:
+            logger.info("媒体相似候选 #%s，保留为独立消息", image_candidate[0])
 
     # ---------- 语言路由 ----------
     # 在翻译之前决定「要不要翻译」。全中文原文一个字都不送模型
@@ -392,12 +504,17 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
     # 翻译对照表。之前是三次独立匹配（各自 find_hits 一遍 3400+ 别名）
     hits = []
     det = classify.Detection()
-    if text_raw:
-        hits = glossary.find_hits(
+    if text_raw and channel.theme == "gaming":
+        hits = await asyncio.to_thread(glossary.find_hits,
             text_raw, glossary.terms_all(langs=("en", "ja", "zh")))
-        det = await classify.resolve_game(text_raw, channel, hits=hits)
+        det = (classify.detect(text_raw, channel, hits) if deferred else
+               await classify.resolve_game(text_raw, channel, hits=hits))
+    elif text_raw:
+        from .themes import get_theme
+        det.topics = [str(topic) for topic in get_theme(channel.theme).config.get("topics", [])
+                      if str(topic).casefold() in text_raw.casefold()]
 
-    game = det.game or channel.game
+    game = (det.game or channel.game) if channel.theme == "gaming" else None
 
     # ---------- 实体标注 ----------
     # 中文原文不翻译也照样标注 —— 这正是中文别名（卡妈、看板娘）的用处。
@@ -419,7 +536,14 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
             result.status = "skipped"          # 纯图无文字：零 AI 调用
     elif not channel.translate:
         result.status = "disabled"
-    elif dup is not None and not channel.force_push:
+    elif deferred:
+        result.status = "pending"
+    elif (dup is not None and not channel.force_push
+          and dup[1] == "text_exact"):
+        # 文本判重（text_exact / simhash）是同文案：复用译文零成本且正确。
+        # phash 判重是「同图配不同文案」—— 图重复不代表文字重复，复用译文
+        # 必然张冠李戴（2026-09 案例：黑首帧假阳性撞上崩铁推文，ZZZ 视频挂
+        # 着崩铁译文）。phash 判重的消息落到下面正常翻译分支。
         reused = _existing_translation(dup[0])
         if reused:
             result = tr.TranslateResult(text_zh=reused, status="ok", from_cache=True)
@@ -427,12 +551,14 @@ async def ingest(client, channel_row_id: int, messages: list) -> int | None:
             result.status = "skipped"
     else:
         prompt = prompts.resolve_prompt(channel, game)
-        prompt += prompts.game_context(game)
+        if channel.theme == "gaming":
+            prompt += prompts.game_context(game)
         try:
             try:
                 result = await tr.translate(text_for_translate, prompt, game,
                                             entities_data, hits=hits,
-                                            bilingual_policy=channel.bilingual_policy)
+                                            bilingual_policy=channel.bilingual_policy,
+                                            **({"theme": channel.theme} if channel.theme != "gaming" else {}))
             except TypeError as exc:
                 # Keep compatibility with third-party/test translators that
                 # still implement the pre-policy signature.
@@ -507,7 +633,8 @@ def _persist(channel, first, messages, text_raw, t_hash, sim, dup, result,
                 _album_anchor_q(s, channel.id, gid)).scalar_one_or_none()
             if anchor is not None:
                 changed = _attach_to_anchor(s, anchor, text_raw, result,
-                                            media_outs, channel.translate)
+                                            media_outs, channel.translate,
+                                            archive_channel=channel)
                 need_retranslate = (changed and
                                     anchor.translate_status == "pending")
                 anchor_id = anchor.id
@@ -523,6 +650,7 @@ def _persist(channel, first, messages, text_raw, t_hash, sim, dup, result,
             tg_message_id=str(first.id),
             grouped_id=str(first.grouped_id) if getattr(first, "grouped_id", None) else None,
             text_raw=text_raw,
+            theme=channel.theme,
             text_zh=result.text_zh or None,
             translate_status=result.status,
             translate_error=result.error,
@@ -538,7 +666,7 @@ def _persist(channel, first, messages, text_raw, t_hash, sim, dup, result,
             simhash=sim or None,
             duplicate_of=dup[0] if dup else None,
             dup_reason=dup[1] if dup else None,
-            deeplink=deeplink_for(channel, first.id),
+            deeplink=getattr(first, "source_url", None) or deeplink_for(channel, first.id),
             sender_name=sender_name,
             has_media=bool(media_outs),
             # JSON 列，直接给 list ——
@@ -556,20 +684,36 @@ def _persist(channel, first, messages, text_raw, t_hash, sim, dup, result,
         )
         s.add(row)
         s.flush()
+        archive_tasks = []
         for o in media_outs:
-            s.add(MessageMedia(
+            media_row = MessageMedia(
                 message_id=row.id, kind=o.kind, thumb_path=o.thumb_path,
+                source_tg_id=str(o.source_message_id) if o.source_message_id else None,
+                source_identity=o.source_identity, status=o.status, error=o.error,
+                original_path=o.original_path, original_bytes=o.original_bytes, sha256=o.sha256,
                 thumb_bytes=o.thumb_bytes, width=o.width, height=o.height,
                 duration=o.duration, orig_bytes=o.orig_bytes, mime=o.mime,
                 phash=o.phash, dhash=o.dhash, video_path=o.video_path,
                 video_bytes=o.video_bytes, video_status=o.video_status,
                 has_spoiler=o.has_spoiler,
-            ))
+            )
+            s.add(media_row)
+            if o.status == "queued" or o.video_status == "queued":
+                archive_tasks.append((media_row, o))
+        s.flush()
+        for media_row, out in archive_tasks:
+            _queue_media(s, channel.id, media_row, out.source_message_id or first.id)
+        if result.status == "pending":
+            from .jobs import enqueue
+            enqueue("translate", f"translate:{row.id}:{t_hash}", {"message_id": row.id}, session=s)
         ch = s.get(Channel, channel.id)
         if ch is not None:
             ch.message_count += 1
             ch.last_message_at = row.published_at
         new_id = row.id
+        s.flush()
+        from .content import record
+        record(new_id, session=s)
 
     logger.info("入库 #%s [%s] dup=%s 翻译=%s", new_id, channel.title,
                 dup[1] if dup else "-", result.status)

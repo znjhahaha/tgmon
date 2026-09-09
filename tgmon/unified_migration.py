@@ -16,6 +16,13 @@ def backup_before_upgrade():
     if not path.is_file():
         return
     with sqlite3.connect(str(path)) as source:
+        exists = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migration'").fetchone()
+        if not exists or not source.execute("SELECT 1 FROM schema_migration WHERE version=2").fetchone():
+            target = path.parent / "backups" / "before-general-v2.sqlite3"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                with sqlite3.connect(str(target)) as destination:
+                    source.backup(destination)
         columns = {r[1] for r in source.execute("PRAGMA table_info(conversation_turn)")}
         if not columns or "event_key" in columns:
             return
@@ -61,12 +68,16 @@ def migrate():
             if key in seen or s.get(QqEvent, key):
                 continue
             seen.add(key)
-            s.add(QqEvent(event_key=key, status="delivered", result={}, updated_at=inbound.created_at))
+            s.add(QqEvent(event_key=key, status="legacy", result={}, updated_at=inbound.created_at))
             scope = scope_keys(group, inbound.member_openid)[0]
             conv = _get(s, scope, True, group, inbound.member_openid if private else "")
-            for role, value in (("user", inbound.content), ("assistant", inbound.reply)):
+            # Legacy inbound.reply only proves generation, not QQ delivery.
+            # Preserve the source utterance without inventing a completed turn.
+            for role, value in (("user", inbound.content),):
                 if value:
                     turn_key = hashlib.sha256(f"{scope}\0{inbound.msg_id}\0{role}\0{0}".encode()).hexdigest()
+                    if s.query(ConversationTurn.id).filter_by(event_key=turn_key).first():
+                        continue
                     s.add(ConversationTurn(conversation_id=conv.id, actor_id=inbound.member_openid,
                         role=role, content=value, event_key=turn_key, created_at=inbound.created_at))
         for group in s.query(QqGroup).filter(QqGroup.last_seen_msg_id.isnot(None)):

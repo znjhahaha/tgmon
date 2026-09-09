@@ -134,15 +134,21 @@ async def test_summarize_quote_matching_ignores_whitespace(db, monkeypatch):
         conv = (s.query(Conversation)
                 .filter(Conversation.scope_id == "v2-g").first())
         conv_id = conv.id
+        # turn_id 必须用真实落库的轮次 id，不能假设 turn.id == conv.id ——
+        # 那只在全新库里成立；前序模块遗留的 Conversation 行会顶偏自增 id
+        turn_id = (s.query(ConversationTurn)
+                   .filter(ConversationTurn.conversation_id == conv_id,
+                           ConversationTurn.content == "我 叫 科比，喜欢 流萤")
+                   .first().id)
 
     class _Res:
         ok = True
         text = ('{"summary":"聊称呼和喜好","facts":[{"key":"称呼","text":"自称科比",'
-                '"turn_id":%d,"quote":"我叫科比， 喜欢流萤"}]}' % conv_id)
+                '"turn_id":%d,"quote":"我叫科比， 喜欢流萤"}]}' % turn_id)
         provider_name = "test"
         tokens_in = tokens_out = 0
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         return _Res()
 
     from tgmon.providers import registry
@@ -173,7 +179,7 @@ async def test_agent_nickname_action(db, monkeypatch):
         provider_name = "test"
         tokens_in = tokens_out = 0
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         return _Res()
 
     from tgmon.providers import registry
@@ -193,7 +199,7 @@ async def test_agent_remember_writes_profile(db, monkeypatch):
         provider_name = "test"
         tokens_in = tokens_out = 0
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         return _Res()
 
     from tgmon.providers import registry
@@ -204,8 +210,8 @@ async def test_agent_remember_writes_profile(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_chat_second_stage_uses_context(db, monkeypatch):
-    """chat 动作：有记忆时走第二阶段，回复携带记忆内容。"""
+async def test_agent_chat_uses_context_in_one_call(db, monkeypatch):
+    """chat 动作：第一次调用同时读取记忆并生成最终回复。"""
     from tgmon.qqbot import agent
 
     member_profile.set_nickname("v2-a", "科比")
@@ -215,30 +221,23 @@ async def test_agent_chat_second_stage_uses_context(db, monkeypatch):
 
     class _Route:
         ok = True
-        text = '{"action":"chat","args":{},"reply":"先这样回"}'
+        text = '{"action":"chat","args":{},"reply":"科比你上次问的流萤，我记得～"}'
         provider_name = "test"
         tokens_in = tokens_out = 0
 
-    class _Chat:
-        ok = True
-        text = "科比你上次问的流萤，我记得～"
-        provider_name = "test"
-        tokens_in = tokens_out = 0
-
-    async def _fake(system, user):
-        calls.append((system, user))
-        return _Route() if len(calls) == 1 else _Chat()
+    async def _fake(system, user, **kw):
+        calls.append((system, user, kw))
+        return _Route()
 
     from tgmon.providers import registry
     monkeypatch.setattr(registry, "complete_with_failover", _fake)
     replies = await agent.handle("接着聊", "v2-g", True, "v2-a")
-    # 第二阶段的回复胜出，且 prompt 里带着结构化上下文
+    # 最终回复与结构化上下文在同一次模型请求中完成。
     assert replies[0].text == "科比你上次问的流萤，我记得～"
-    assert len(calls) == 2
-    assert "【当前用户】科比" in calls[1][1]
-    assert "流萤情报" in calls[1][1]
-    assert "CHAT_SYSTEM" not in calls[1][1]          # system 是人格提示词
-    assert "接着聊" in calls[1][1]
+    assert len(calls) == 1
+    assert "【当前用户】科比" in calls[0][1]
+    assert "流萤情报" in str(calls[0][2]["messages"])
+    assert "接着聊" in calls[0][1]
 
 
 @pytest.mark.asyncio
@@ -254,7 +253,7 @@ async def test_agent_chat_fallback_without_memory(db, monkeypatch):
         provider_name = "test"
         tokens_in = tokens_out = 0
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         calls.append((system, user))
         return _Res()
 
@@ -267,7 +266,7 @@ async def test_agent_chat_fallback_without_memory(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_agent_chat_persona_merged(db, monkeypatch):
-    """人设修复：QQ_AI_SYSTEM 必须进入第二阶段，无记忆时也强制走第二阶段。"""
+    """人设在第一次请求中生效，无记忆时也只调用一次。"""
     from tgmon.qqbot import agent
 
     settings.set_many({"QQ_AI_SYSTEM": "【角色人设：纳西妲】你是纳西妲，智慧之神。"})
@@ -282,24 +281,24 @@ async def test_agent_chat_persona_merged(db, monkeypatch):
             provider_name = "test"
             tokens_in = tokens_out = 0
 
-        async def _fake(system, user):
+        async def _fake(system, user, **kw):
             calls.append((system, user))
             return _Res()
 
         from tgmon.providers import registry
         monkeypatch.setattr(registry, "complete_with_failover", _fake)
-        # 无记忆（v2-nogroup 无轮次）但有人设 → 仍走第二阶段
+        # 无记忆但有人设，首个请求仍须包含人设。
         replies = await agent.handle("你是谁", "v2-nogroup", True, "v2-nomember")
-        assert len(calls) == 2                       # 路由 + 人设阶段
-        assert "纳西妲" in calls[1][0]               # 第二阶段 system 带人设
-        assert "你是谁" in calls[1][1]
+        assert len(calls) == 1
+        assert "纳西妲" in calls[0][0]
+        assert "你是谁" in calls[0][1]
     finally:
         settings.set_many({"QQ_AI_SYSTEM": ""})
 
 
 @pytest.mark.asyncio
-async def test_agent_chat_persona_suppresses_route_reply(db, monkeypatch):
-    """有人设时，第二阶段回复胜出（路由 reply 只是兜底）。"""
+async def test_agent_chat_persona_reply_is_final(db, monkeypatch):
+    """有人设时，首个请求的 reply 即为最终答复。"""
     from tgmon.qqbot import agent
 
     settings.set_many({"QQ_AI_SYSTEM": "你是纳西妲。"})
@@ -308,23 +307,18 @@ async def test_agent_chat_persona_suppresses_route_reply(db, monkeypatch):
 
         class _Route:
             ok = True
-            text = '{"action":"chat","args":{},"reply":"我是 tgmon 群助手～"}'
+            text = '{"action":"chat","args":{},"reply":"呼……你好呀，我是纳西妲～"}'
             provider_name = "test"
             tokens_in = tokens_out = 0
 
-        class _Chat:
-            ok = True
-            text = "呼……你好呀，我是纳西妲～"
-            provider_name = "test"
-            tokens_in = tokens_out = 0
-
-        async def _fake(system, user):
+        async def _fake(system, user, **kw):
             calls.append((system, user))
-            return _Route() if len(calls) == 1 else _Chat()
+            return _Route()
 
         from tgmon.providers import registry
         monkeypatch.setattr(registry, "complete_with_failover", _fake)
         replies = await agent.handle("你是谁", "v2-nogroup", True, "v2-nomember")
         assert replies[0].text == "呼……你好呀，我是纳西妲～"
+        assert len(calls) == 1
     finally:
         settings.set_many({"QQ_AI_SYSTEM": ""})

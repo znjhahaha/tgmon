@@ -127,18 +127,20 @@ def compose_album(thumb_paths: list[str]) -> str:
 
 
 async def upload_album(group_openid: str, thumb_paths: list[str],
-                       raise_fatal: bool = False) -> str | None:
+                       raise_fatal: bool = False,
+                       bot: dict | None = None) -> str | None:
     """Upload one media file for a whole album; keep single-photo uploads intact."""
     if not thumb_paths:
         return None
     if len(thumb_paths) == 1:
-        return await upload_image(group_openid, thumb_paths[0], raise_fatal=raise_fatal)
+        return await upload_image(group_openid, thumb_paths[0],
+                                  raise_fatal=raise_fatal, bot=bot)
     try:
         path = await asyncio.to_thread(compose_album, thumb_paths)
     except Exception as exc:
         logger.warning("图片组合成失败（未发送残缺相册）: %s", exc)
         return None
-    return await upload_image(group_openid, path, raise_fatal=raise_fatal)
+    return await upload_image(group_openid, path, raise_fatal=raise_fatal, bot=bot)
 
 
 def _signing_key() -> bytes:
@@ -308,7 +310,8 @@ async def cleanup_github_relay(max_age_days: int = 1) -> int:
 
 
 async def upload_image(group_openid: str, thumb_path: str | None,
-                       raise_fatal: bool = False) -> str | None:
+                       raise_fatal: bool = False,
+                       bot: dict | None = None) -> str | None:
     """图片 → file_info。失败返回 None（调用方降级）。
 
     优先 file_data 直接上传本地 JPEG。失败时使用配置的 GitHub 中转，
@@ -325,7 +328,7 @@ async def upload_image(group_openid: str, thumb_path: str | None,
     jpeg = await asyncio.to_thread(_jpeg_bytes, thumb_path)
     if jpeg:
         try:
-            return await client.upload_group_file_data(group_openid, 1, jpeg)
+            return await client.upload_group_file_data(group_openid, 1, jpeg, bot=bot)
         except QqApiError as exc:
             if _fatal(exc):
                 raise
@@ -341,7 +344,7 @@ async def upload_image(group_openid: str, thumb_path: str | None,
             if not url:
                 return None
             try:
-                return await client.upload_group_file(group_openid, 1, url)
+                return await client.upload_group_file(group_openid, 1, url, bot=bot)
             except QqApiError as e:
                 if _fatal(e):
                     raise
@@ -356,7 +359,7 @@ async def upload_image(group_openid: str, thumb_path: str | None,
     if not url:
         return None
     try:
-        return await client.upload_group_file(group_openid, 1, url)
+        return await client.upload_group_file(group_openid, 1, url, bot=bot)
     except QqApiError as e:
         if _fatal(e):
             raise
@@ -364,13 +367,14 @@ async def upload_image(group_openid: str, thumb_path: str | None,
         return None
 
 
-async def upload_video(group_openid: str, mid: int) -> str | None:
+async def upload_video(group_openid: str, mid: int,
+                       bot: dict | None = None) -> str | None:
     """归档视频 → file_info（签名限时 URL）。失败返回 None。"""
     url = video_signed_url(mid)
     if not url:
         return None
     try:
-        return await client.upload_group_file(group_openid, 2, url)
+        return await client.upload_group_file(group_openid, 2, url, bot=bot)
     except QqApiError as e:
         logger.warning("视频上传失败（降级为不发视频）: %s", e)
         return None

@@ -8,7 +8,7 @@
 网络调用一律在 session 外（先拷出普通值，回写再开短 session）。
 
 平台约束（2026-09 官方文档）：
-- 主动消息每群 20/分钟、1000/天；Bot 全局 30-60/分钟
+- 主动消息权限按机器人账户反馈判断，保留本地推送预算
 - 主动消息禁止 URL（错误码 40054010）→ 推送文案是纯文本摘要
 - 机器人不在群（40034101/40054003）→ 标记 dropped 停用，页面提示重新拉群
 
@@ -92,27 +92,28 @@ def _push_content(payload: dict, message_id: int) -> tuple[str, list[str]]:
     return _format_text(payload), photos
 
 
-async def _send(openid: str, text: str) -> tuple[bool, str | None, bool, bool]:
+async def _send(openid: str, text: str,
+                bot: dict | None = None) -> tuple[bool, str | None, bool, bool]:
     """纯网络层投递。返回 (成功, 错误描述, 机器人不在群, 权限类不可重试)。
 
     40054010（含 URL）/ 40054007（超长）做一次补救重发，其余原样上抛。
     40034105（主动消息无权限）是主体资质问题，重试必然失败 → fatal。
     """
     try:
-        await client.send_group_text(openid, text)
+        await client.send_group_text(openid, text, bot=bot)
         return True, None, False, False
     except QqApiError as e:
         err = f"code={e.code} {e.message}"
         if e.code == client.ERR_URL_FORBIDDEN:
             try:
-                await client.send_group_text(openid, _URL_RE.sub("", text))
+                await client.send_group_text(openid, _URL_RE.sub("", text), bot=bot)
                 return True, None, False, False
             except QqApiError as e2:
                 err = f"code={e2.code} {e2.message}"
         elif e.code == client.ERR_MSG_TOO_LONG:
             try:
                 await client.send_group_text(
-                    openid, text[:MAX_CONTENT - 1] + "…")
+                    openid, text[:MAX_CONTENT - 1] + "…", bot=bot)
                 return True, None, False, False
             except QqApiError as e2:
                 err = f"code={e2.code} {e2.message}"
@@ -131,14 +132,15 @@ async def _send(openid: str, text: str) -> tuple[bool, str | None, bool, bool]:
 
 
 async def _send_media(openid: str,
-                      photos: list[str], text: str = "") -> tuple[bool, str | None, bool, bool]:
+                      photos: list[str], text: str = "",
+                      bot: dict | None = None) -> tuple[bool, str | None, bool, bool]:
     """One complete album is one outgoing message and one daily quota unit."""
     from . import media as qq_media
     try:
-        fi = await qq_media.upload_album(openid, photos, raise_fatal=True)
+        fi = await qq_media.upload_album(openid, photos, raise_fatal=True, bot=bot)
         if not fi:
             return False, "整组图片上传失败（文件缺失或中转不可用）", False, False
-        await client.send_group_media(openid, fi, content=text or None)
+        await client.send_group_media(openid, fi, content=text or None, bot=bot)
         return True, None, False, False
     except QqApiError as exc:
         error = f"code={exc.code} {exc.message}"
@@ -152,11 +154,12 @@ async def _send_media(openid: str,
 
 
 async def _deliver_content(openid: str, text: str,
-                           photos: list[str]) -> tuple[bool, str | None, bool, bool]:
+                           photos: list[str],
+                           bot: dict | None = None) -> tuple[bool, str | None, bool, bool]:
     """Caption and whole album share one media message."""
     if photos:
-        return await _send_media(openid, photos, text)
-    return await _send(openid, text)
+        return await _send_media(openid, photos, text, bot=bot)
+    return await _send(openid, text, bot=bot)
 
 
 def _record(did: int, ok: bool, err: str | None, attempts: int,
@@ -207,7 +210,7 @@ def _claim_groups(n_msgs: int = 1) -> list[dict]:
     （本项目单 worker，防御性写法）。
     """
     today = _today_local()
-    limit = int(settings.get("QQ_DAILY_LIMIT") or 950)
+    limit = int(settings.get("QQ_DAILY_LIMIT") or 0)
     n_msgs = max(1, n_msgs)
     out: list[dict] = []
     with session_scope() as s:
@@ -215,7 +218,7 @@ def _claim_groups(n_msgs: int = 1) -> list[dict]:
             if g.sent_date != today:
                 g.sent_date = today
                 g.sent_today = 0
-            if g.sent_today >= limit or g.sent_today + n_msgs > limit:
+            if limit > 0 and (g.sent_today >= limit or g.sent_today + n_msgs > limit):
                 log_event("warning", "qqbot",
                           f"群 {g.nickname or g.group_openid[:8]}… 达当日上限，本轮丢弃")
                 continue
@@ -257,13 +260,25 @@ async def retry_pending() -> int:
 
     n = 0
     for did, openid, mid, attempts in pending:
-        # 群还在且启用才重试
+        # 群还在且启用才重试；顺带取归属机器人
         with session_scope() as s:
             g = s.query(QqGroup).filter(QqGroup.group_openid == openid).first()
             alive = bool(g and g.enabled)
+            bot_id = g.bot_id if g is not None else None
         if not alive:
             _record(did, False, "群已停用或删除", attempts + 1, openid, False)
             # 直接标 failed，不再进重试队列
+            with session_scope() as s:
+                d = s.get(QqDelivery, did)
+                if d is not None:
+                    d.status = "failed"
+                    d.next_retry_at = None
+            continue
+        try:
+            bot = client.resolve_bot(bot_id=bot_id) if bot_id else client.resolve_bot()
+        except client.QqApiError as e:
+            _record(did, False, f"机器人不可用: {e.message}", attempts + 1,
+                    openid, False)
             with session_scope() as s:
                 d = s.get(QqDelivery, did)
                 if d is not None:
@@ -295,7 +310,7 @@ async def retry_pending() -> int:
 
         # 日限内才继续
         today = _today_local()
-        limit = int(settings.get("QQ_DAILY_LIMIT") or 950)
+        limit = int(settings.get("QQ_DAILY_LIMIT") or 0)
         n_msgs = 1
         over = False
         with session_scope() as s:
@@ -304,7 +319,7 @@ async def retry_pending() -> int:
                 if g.sent_date != today:
                     g.sent_date = today
                     g.sent_today = 0
-                if g.sent_today >= limit or g.sent_today + n_msgs > limit:
+                if limit > 0 and (g.sent_today >= limit or g.sent_today + n_msgs > limit):
                     over = True
                 else:
                     g.sent_today += n_msgs
@@ -317,7 +332,7 @@ async def retry_pending() -> int:
                     d.next_retry_at = None
             continue
 
-        ok, err, dropped, fatal = await _deliver_content(openid, text, photos)
+        ok, err, dropped, fatal = await _deliver_content(openid, text, photos, bot=bot)
         _record(did, ok, err, attempts + 1, openid, dropped, fatal)
         if ok:
             n += 1
@@ -333,45 +348,57 @@ async def test_message(openid: str) -> dict:
         if g is None:
             return {"ok": False, "error": "群不存在"}
         nickname = g.nickname or openid[:8]
+        bot_id = g.bot_id
         d = QqDelivery(group_openid=openid, message_id=None)
         s.add(d)
         s.flush()
         did = d.id
-    ok, err, dropped, fatal = await _send(openid, text)
+    try:
+        bot = client.resolve_bot(bot_id=bot_id) if bot_id else client.resolve_bot()
+    except client.QqApiError as e:
+        _record(did, False, f"机器人不可用: {e.message}", 1, openid, False)
+        return {"ok": False, "error": e.message[:200], "nickname": nickname}
+    ok, err, dropped, fatal = await _send(openid, text, bot=bot)
     _record(did, ok, err, 1, openid, dropped, fatal)
     if ok:
         return {"ok": True, "nickname": nickname}
     return {"ok": False, "error": (err or "失败")[:200], "nickname": nickname}
 
 
-async def handle_callback_event(event: dict) -> dict:
+async def handle_callback_event(event: dict, bot: dict | None = None) -> dict:
     """处理腾讯事件（admin 的 /qqbot/callback 与 /qqbot/bridge 都走这里）。
 
+    bot：事件归属的机器人上下文（client.resolve_bot 的返回值）。多机器人
+    时由入口按 X-Bot-Appid 头 / 桥报文解析后传入；进群事件据此记录群归属。
+
     关心四件事：
-    - GROUP_ADD_ROBOT     机器人进群 → 记录 group_openid
+    - GROUP_ADD_ROBOT     机器人进群 → 记录 group_openid 与归属机器人
     - GROUP_DEL_ROBOT     机器人被移出 → 停用该群
     - GROUP_AT_MESSAGE_CREATE  被 @ → 命令路由 / AI 对话（commands.py）
     - C2C_MESSAGE_CREATE  私聊 → AI 对话
     返回 {"handled": 类型, "replies": list[Reply] or [], "msg_id": 被动回复用,
-          "channel": "group"/"c2c", "target": 回复目标 openid}
+          "channel": "group"/"c2c", "target": 回复目标 openid, "bot": 机器人上下文}
     """
     from . import commands
 
     etype = str(event.get("type") or event.get("t") or "")
     d = event.get("d") or {}
     openid = str(d.get("group_openid") or "")
+    owner = (bot or {}).get("id") or None
 
     if etype == "GROUP_ADD_ROBOT" and openid:
         with session_scope() as s:
             g = s.query(QqGroup).filter(QqGroup.group_openid == openid).first()
             if g is None:
-                s.add(QqGroup(group_openid=openid))
+                s.add(QqGroup(group_openid=openid, bot_id=owner))
                 log_event("info", "qqbot", f"机器人进群（openid {openid[:8]}…），"
                                            "去后台「QQ 机器人」页给它标个群名")
             else:
                 g.enabled = True
                 g.dropped_at = None
-        return {"handled": "add", "replies": [], "msg_id": None}
+                if owner:
+                    g.bot_id = owner
+        return {"handled": "add", "replies": [], "msg_id": None, "bot": bot}
 
     if etype == "GROUP_DEL_ROBOT" and openid:
         with session_scope() as s:
@@ -380,24 +407,31 @@ async def handle_callback_event(event: dict) -> dict:
                 g.enabled = False
                 g.dropped_at = datetime.utcnow()
         log_event("info", "qqbot", f"机器人被移出群（openid {openid[:8]}…），已停用")
-        return {"handled": "del", "replies": [], "msg_id": None}
+        return {"handled": "del", "replies": [], "msg_id": None, "bot": bot}
 
     if etype == "GROUP_AT_MESSAGE_CREATE" and openid:
         with session_scope() as s:
             g = s.query(QqGroup).filter(QqGroup.group_openid == openid).first()
             if g is None:
                 # 进群回调漏了（比如换接入方式之前拉的群）也能被 @ 激活补录
-                s.add(QqGroup(group_openid=openid))
+                s.add(QqGroup(group_openid=openid, bot_id=owner))
                 log_event("info", "qqbot",
                           f"被 @ 时发现群（openid {openid[:8]}…）没有记录，已补录")
-        replies, msg_id = await commands.handle_group_message(d)
+        replies, msg_id = await commands.handle_group_message(d, bot=bot)
         return {"handled": "at", "replies": replies, "msg_id": msg_id,
-                "channel": "group", "target": openid}
+                "channel": "group", "target": openid, "bot": bot,
+                "conversation": {"group": openid,
+                    "member": str((d.get("author") or {}).get("member_openid") or ""),
+                    "content": commands._clean_content(str(d.get("content") or ""))}}
 
     if etype == "C2C_MESSAGE_CREATE":
-        replies, msg_id = await commands.handle_c2c_message(d)
+        replies, msg_id = await commands.handle_c2c_message(d, bot=bot)
         return {"handled": "c2c", "replies": replies, "msg_id": msg_id,
                 "channel": "c2c",
-                "target": str((d.get("author") or {}).get("user_openid") or "")}
+                "target": str((d.get("author") or {}).get("user_openid") or ""),
+                "bot": bot,
+                "conversation": {"group": "",
+                    "member": str((d.get("author") or {}).get("user_openid") or ""),
+                    "content": commands._clean_content(str(d.get("content") or ""))}}
 
-    return {"handled": None, "replies": [], "msg_id": None}
+    return {"handled": None, "replies": [], "msg_id": None, "bot": bot}

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}主题与扩展 · tgmon{% endblock %}
+{% block body %}
+<h1>主题与扩展</h1>
+<h2>主题</h2>
+<form method="post" action="/plugins/themes/default" class="inline">
+  <label>默认主题<select name="theme">{% for theme in themes %}<option value="{{ theme.key }}" {{ 'selected' if theme.key == default_theme }}>{{ theme.label }}</option>{% endfor %}</select></label>
+  <button class="btn">保存</button>
+</form>
+<div style="overflow:auto"><table>
+  <tr><th>主题</th><th>标识</th><th>版本</th></tr>
+  {% for theme in themes %}<tr><td>{{ theme.label }}</td><td>{{ theme.key }}</td><td>{{ theme.version }}</td></tr>{% endfor %}
+</table></div>
+<details><summary>安装主题</summary>
+  <form method="post" action="/plugins/themes/install">
+    <label>主题包 JSON<textarea name="package" required rows="5"></textarea></label>
+    <button class="btn">安装</button>
+  </form>
+</details>
+<h2>本地插件</h2>
+<div style="overflow:auto"><table>
+  <tr><th>名称</th><th>版本</th><th>状态</th><th>错误</th><th>操作</th></tr>
+  {% for plugin in plugins %}<tr>
+    <td>{{ plugin.name }}</td><td>{{ plugin.version }}</td><td>{{ plugin.status }}</td>
+    <td style="max-width:360px;overflow-wrap:anywhere">{{ plugin.error }}</td>
+    <td><form method="post" action="/plugins/{{ plugin.name }}/{{ 'stop' if plugin.status == 'running' else 'start' }}">
+      <button class="btn sm">{{ '停用' if plugin.status == 'running' else '启用' }}</button>
+    </form>
+    <details><summary>配置</summary><form method="post" action="/plugins/{{ plugin.name }}/config">
+      <label>配置 JSON<textarea name="config">{{ plugin.config }}</textarea></label><button class="btn sm">保存</button>
+    </form></details></td>
+  </tr>{% else %}<tr><td colspan="5">暂无插件</td></tr>{% endfor %}
+</table></div>
+<form method="post" action="/plugins/install" class="inline">
+  <label>服务器上的插件目录<input name="source" required></label>
+  <button class="btn">安装本地插件</button>
+</form>
+<h2>MCP</h2>
+<form method="post" action="/plugins/mcp/config">
+  <label><input name="enabled" type="checkbox" {{ 'checked' if mcp_enabled }}>启用外部工具</label>
+  <div class="grid g2">
+    <label>服务配置<textarea name="servers" rows="7">{{ mcp_servers }}</textarea></label>
+    <label>机器人 AppID 与授权工具<textarea name="tools" rows="7">{{ mcp_tools }}</textarea></label>
+  </div>
+  <button class="btn">保存</button>
+</form>
+<h2>处理队列</h2>
+<div style="overflow:auto"><table>
+  <tr><th>队列</th><th>状态</th><th>数量</th></tr>
+  {% for row in queues %}<tr><td>{{ row.queue }}</td><td>{{ row.status }}</td><td>{{ row.count }}</td></tr>{% endfor %}
+</table></div>
+{% if failed %}<h2>待处理故障</h2>
+<div style="overflow:auto"><table>
+  <tr><th>任务</th><th>队列</th><th>错误</th></tr>
+  {% for row in failed %}<tr><td>{{ row.id }}</td><td>{{ row.queue }}</td><td style="overflow-wrap:anywhere">{{ row.error }}</td></tr>{% endfor %}
+</table></div>{% endif %}
+{% endblock %}

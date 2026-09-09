@@ -57,6 +57,7 @@ def _rate_limit(key_id: int, rate: int) -> None:
 async def list_messages(request: Request,
                         channel_id: int | None = None,
                         game: str | None = None,
+                        theme: str | None = None,
                         q: str | None = None,
                         since: str | None = Query(None, description="ISO 时间"),
                         include_duplicates: bool = False,
@@ -69,6 +70,7 @@ async def list_messages(request: Request,
     with session_scope() as s:
         from ...message_query import query as message_query
         query = message_query(s, game=game or "", keyword=q or "",
+                              theme=theme or "",
                               channel_ids=[channel_id] if channel_id else None,
                               duplicates="all" if include_duplicates else "hide")
         if status:
@@ -96,7 +98,7 @@ async def list_messages(request: Request,
                    .order_by(MonitorMessage.published_at.desc())
                    .offset(offset).limit(limit).all()]
 
-    items = [x for x in (outputs.serialize(i) for i in ids) if x]
+    items = outputs.serialize_many(ids)
     return JSONResponse({"total": total, "limit": limit, "offset": offset,
                          "items": items})
 

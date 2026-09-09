@@ -37,6 +37,10 @@
   <div class="card">
     <h2 style="margin-top:0">基础</h2>
     <div class="inline">
+      <label>主题
+        <select name="theme">
+        {% for theme in themes %}<option value="{{ theme.key }}" {{ 'selected' if c.theme == theme.key }}>{{ theme.label }}</option>{% endfor %}
+        </select></label>
       <label>默认游戏（兜底值，留空则不限）
         <input name="game" value="{{ c.game }}" list="games-list"></label>
       <label>候选游戏（逗号分隔，留空=全库检测）
@@ -59,7 +63,6 @@
       <label><input type="checkbox" name="allow_photo" {{ 'checked' if c.allow_photo }}>保存图片</label>
       <label><input type="checkbox" name="allow_video" {{ 'checked' if c.allow_video }}>保存视频缩略图</label>
       <label><input type="checkbox" name="allow_document" {{ 'checked' if c.allow_document }}>保存文档</label>
-      <label><input type="checkbox" name="keep_video" {{ 'checked' if c.keep_video }}>归档视频（下载转码存私有目录）</label>
     </div>
     <div class="inline">
       <label>媒体大小上限 MB（0=不限）
@@ -67,8 +70,6 @@
       <label>归档视频源上限 MB（0=用全局默认）
         <input name="video_max_mb" value="{{ c.video_max_mb }}" inputmode="numeric"></label>
     </div>
-    <p class="hint">归档视频受系统页「视频归档」总开关和大小/时长上限约束，
-      双闸门都开才会真的下载转码。</p>
     <button class="btn">保存</button>
   </div>
 

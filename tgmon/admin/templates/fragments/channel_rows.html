@@ -34,6 +34,19 @@
       {% else %}
         <span class="tag warn" title="TG 最新 #{{ c.last_tg_id }}，已入库 #{{ c.db_max_tg }}">落后 {{ c.catchup_gap }}（下轮对齐只补窗口内）</span>
       {% endif %}
+      {% if c.last_round %}
+      <br><span class="dim" style="font-size:11px" title="最近一轮对齐（{{ c.last_catchup_at|ago if c.last_catchup_at else '' }}）">
+        {% if c.last_round.status == 'aligned' %}
+          上轮补 {{ c.last_round.ingested }} 条{% if c.last_round.ingested == 0 %}（窗口外）{% endif %}
+        {% elif c.last_round.status == 'synced' %}
+          上轮无更新
+        {% elif c.last_round.status == 'empty' %}
+          空频道
+        {% elif c.last_round.status == 'error' %}
+          <span class="err" title="{{ c.last_round.error }}">上轮失败</span>
+        {% endif %}
+      </span>
+      {% endif %}
     </td>
     <td class="dim">{{ c.last_message_at|ago }}</td>
     <td>

@@ -71,7 +71,7 @@ async def test_local_image_uploads_data_without_public_relay(tmp_path, monkeypat
     Image.new("RGB", (80, 60), "blue").save(tmp_path / "photo.png")
     received = []
 
-    async def upload(group, kind, data):
+    async def upload(group, kind, data, bot=None):
         received.append((group, kind, data))
         return "direct-file-info"
 
@@ -96,7 +96,7 @@ async def test_file_data_request_uploads_without_sending_a_message(monkeypatch):
         requests.append(request)
         return httpx.Response(200, json={"file_info": "uploaded", "ttl": 300})
 
-    async def token():
+    async def token(bot=None):
         return "test-token"
 
     monkeypatch.setattr(qq_client, "_get_token", token)
@@ -115,13 +115,13 @@ async def test_direct_upload_failure_uses_configured_url_fallback(monkeypatch):
     monkeypatch.setattr(qq_media, "_jpeg_bytes", lambda path: b"jpeg-data")
     used = []
 
-    async def direct(*args):
+    async def direct(*args, **kwargs):
         raise QqApiError(400, "Direct upload unavailable")
 
     async def relay(path):
         return "https://raw.githubusercontent.com/owner/relay/main/image.jpg"
 
-    async def upload(group, kind, url):
+    async def upload(group, kind, url, bot=None):
         used.append(url)
         return "fallback-file-info"
 
@@ -136,7 +136,7 @@ async def test_direct_upload_failure_uses_configured_url_fallback(monkeypatch):
 async def test_direct_upload_not_in_group_preserves_fatal_delivery_state(monkeypatch):
     monkeypatch.setattr(qq_media, "_jpeg_bytes", lambda path: b"jpeg-data")
 
-    async def direct(*args):
+    async def direct(*args, **kwargs):
         raise QqApiError(40034101, "Not in group")
 
     async def relay(*args):
@@ -162,7 +162,7 @@ async def test_upload_image_prefers_relay(monkeypatch):
         calls["relay"] = thumb
         return "https://raw.githubusercontent.com/me/relay/main/x.jpg"
 
-    async def _fake_upload(openid, ftype, url):
+    async def _fake_upload(openid, ftype, url, bot=None):
         calls["upload"] = (openid, ftype, url)
         return "FILEINFO123"
 
@@ -206,7 +206,7 @@ async def test_upload_image_retries_once_on_platform_error(monkeypatch):
         calls["relay"] += 1
         return f"https://raw.githubusercontent.com/me/relay/main/x{calls['relay']}.jpg"
 
-    async def _fake_upload(openid, ftype, url):
+    async def _fake_upload(openid, ftype, url, bot=None):
         calls["upload"] += 1
         if calls["upload"] == 1:
             raise QqApiError(850027, "上传失败: timeout")
@@ -230,7 +230,7 @@ async def test_upload_image_retry_exhausted(monkeypatch):
     async def _fake_relay(thumb):
         return "https://raw.githubusercontent.com/me/relay/main/x.jpg"
 
-    async def _fake_upload(openid, ftype, url):
+    async def _fake_upload(openid, ftype, url, bot=None):
         calls["upload"] += 1
         raise QqApiError(850027, "上传失败: timeout")
 
@@ -250,7 +250,7 @@ async def test_upload_image_without_relay_uses_direct(monkeypatch):
         calls["public"] = thumb
         return "https://example.com/media/a/b.webp"
 
-    async def _fake_upload(openid, ftype, url):
+    async def _fake_upload(openid, ftype, url, bot=None):
         calls["upload"] = url
         return "FILEINFO456"
 

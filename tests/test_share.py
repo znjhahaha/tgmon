@@ -350,7 +350,7 @@ async def test_create_share_auto_summary(monkeypatch):
         text = ("V1 新角色技能组与专武完整爆料，含实测截图，"
                 "上线日期定档 09-12")   # 50+ 字：覆盖全部内容、可超 30
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         assert "所有关键信息点" in system   # 新 prompt：不限 30 字
         return _R()
 
@@ -390,7 +390,7 @@ async def test_ai_summary_helper(monkeypatch):
         ok = True
         text = "第一行\n第二行"
 
-    async def _fake_ok(system, user):
+    async def _fake_ok(system, user, **kw):
         return _R()
 
     monkeypatch.setattr(registry, "complete_with_failover", _fake_ok)
@@ -401,7 +401,7 @@ async def test_ai_summary_helper(monkeypatch):
         ok = False
         text = ""
 
-    async def _fake_fail(system, user):
+    async def _fake_fail(system, user, **kw):
         return _R2()
 
     monkeypatch.setattr(registry, "complete_with_failover", _fake_fail)
@@ -421,7 +421,7 @@ async def test_bulk_share_auto_summary(monkeypatch):
         ok = True
         text = "本批 3 条爆料覆盖版本 V0-V2 全部内容"
 
-    async def _fake(system, user):
+    async def _fake(system, user, **kw):
         assert "多条爆料消息" in system      # 合并 prompt
         assert "爆料1" in user and "爆料2" in user   # 全部正文都送进去了
         return _R()

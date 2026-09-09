@@ -114,6 +114,7 @@ class Channel(Base):
     # 混发多款游戏（Seele Leaks 同时发 GI/HSR/ZZZ），填不出单值就只能留空，
     # 结果整个分游戏术语库被绕过。现在真正生效的是每条消息的 game_detected
     game = Column(String(80), nullable=True)
+    theme = Column(String(64), nullable=False, default="gaming")
     # 候选游戏白名单。留空 = 不限，全库投票。填了则判定只在这几个里选 ——
     # 一个只发原神和崩铁的频道不该被 ZZZ 的同名术语拉票
     games = Column(JSONNull, nullable=True)
@@ -263,6 +264,7 @@ class MonitorMessage(Base):
     grouped_id = Column(String(40), nullable=True)  # 相册
 
     text_raw = Column(Text, nullable=False, default="")
+    theme = Column(String(64), nullable=False, default="gaming")
     text_zh = Column(Text, nullable=True)
     # pending / ok / failed / skipped(纯图无文字) / disabled(该频道关了翻译)
     # / skipped_zh(原文已是中文，零 AI 调用)
@@ -331,6 +333,13 @@ class MessageMedia(Base):
     message_id = Column(Integer, ForeignKey("monitor_message.id", ondelete="CASCADE"),
                         nullable=False)
     kind = Column(String(20), nullable=False)  # photo | video | document
+    source_tg_id = Column(String(80), nullable=True, index=True)
+    source_identity = Column(String(160), nullable=True)
+    status = Column(String(24), nullable=False, default="ready")
+    error = Column(Text, nullable=True)
+    sha256 = Column(String(64), nullable=True, index=True)
+    original_path = Column(String(300), nullable=True)
+    original_bytes = Column(Integer, nullable=False, default=0)
     # media/ 下的相对路径
     thumb_path = Column(String(300), nullable=True)
     thumb_bytes = Column(Integer, nullable=False, default=0)
@@ -380,6 +389,7 @@ class Task(Base):
     id = Column(Integer, primary_key=True)
     # send_code / sign_in / sign_in_2fa / logout / sync_dialogs
     # test_provider / retranslate / repush / restart_worker / backfill
+    # archive_video
     kind = Column(String(40), nullable=False)
     payload = Column(JSONNull, nullable=True)
     status = Column(String(20), nullable=False, default="pending", index=True)
@@ -388,6 +398,80 @@ class Task(Base):
     created_at = Column(DateTime, nullable=False, default=_now)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+
+
+class ProcessingJob(Base):
+    __tablename__ = "processing_job"
+
+    id = Column(Integer, primary_key=True)
+    queue = Column(String(24), nullable=False, index=True)
+    scope_key = Column(String(160), nullable=True, index=True)
+    key = Column(String(160), nullable=False, unique=True)
+    payload = Column(JSONNull, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime, nullable=False, default=_now, index=True)
+    lease_until = Column(DateTime, nullable=True)
+    owner = Column(String(64), nullable=True)
+    error = Column(Text, nullable=True)
+    result = Column(JSONNull, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_now)
+    updated_at = Column(DateTime, nullable=False, default=_now)
+
+
+class SourceEvent(Base):
+    __tablename__ = "source_event"
+
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(Integer, ForeignKey("channel.id", ondelete="CASCADE"), nullable=False)
+    source_id = Column(String(80), nullable=False)
+    revision = Column(String(64), nullable=False)
+    grouped_id = Column(String(80), nullable=True)
+    raw = Column(LargeBinary, nullable=True)
+    snapshot = Column(JSONNull, nullable=False)
+    message_id = Column(Integer, nullable=True)
+    received_at = Column(DateTime, nullable=False, default=_now)
+    __table_args__ = (UniqueConstraint("channel_id", "source_id", "revision",
+                                       name="uq_source_event_revision"),)
+
+
+class SourceCursor(Base):
+    __tablename__ = "source_cursor"
+
+    channel_id = Column(Integer, ForeignKey("channel.id", ondelete="CASCADE"), primary_key=True)
+    state = Column(JSONNull, nullable=True)
+    offset_id = Column(Integer, nullable=False, default=0)
+    high_id = Column(Integer, nullable=False, default=0)
+    complete = Column(Boolean, nullable=False, default=False)
+    cutoff = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=_now)
+    error = Column(Text, nullable=True)
+
+
+class SchemaMigration(Base):
+    __tablename__ = "schema_migration"
+    version = Column(Integer, primary_key=True)
+    applied_at = Column(DateTime, nullable=False, default=_now)
+
+
+class ContentRevision(Base):
+    __tablename__ = "content_revision"
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, nullable=False, index=True)
+    digest = Column(String(64), nullable=False)
+    snapshot = Column(JSONNull, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_now)
+    __table_args__ = (UniqueConstraint("message_id", "digest", name="uq_content_revision"),)
+
+
+class ContentRelation(Base):
+    __tablename__ = "content_relation"
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, nullable=False, index=True)
+    related_id = Column(Integer, nullable=False)
+    reason = Column(String(30), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_now)
+    __table_args__ = (UniqueConstraint("message_id", "related_id", "reason", name="uq_content_relation"),)
 
 
 class WorkerState(Base):
@@ -452,6 +536,47 @@ class WebhookDelivery(Base):
     delivered_at = Column(DateTime, nullable=True)
 
 
+class QqBot(Base):
+    """QQ 官方机器人凭据，支持多个机器人同时接入。
+
+    每行一个机器人（q.qq.com 创建后拿 AppID / AppSecret）。token 获取、
+    回调验签、消息发送都按行隔离。群（QqGroup）按「拉它进群的机器人」
+    归属——QQ 平台的 group_openid 本身就是按机器人发的：同一物理群里
+    不同机器人拿到的 openid 不同，多机器人数据天然不冲突。
+
+    历史兼容：迁移（bootstrap）会把旧配置 QQ_APP_ID / QQ_APP_SECRET
+    导入为首行；bot_id 为 NULL 的群在「恰好只有一个启用机器人」时
+    仍然推送（单机器人旧部署零改动）。
+    """
+    __tablename__ = "qq_bot"
+
+    id = Column(Integer, primary_key=True)
+    app_id = Column(String(40), nullable=False, unique=True, index=True)
+    nickname = Column(String(60), nullable=False, default="")
+    # 密文存储（crypto 主密钥加密，与 settings 敏感项同机制）
+    app_secret_enc = Column(String(400), nullable=False, default="")
+    enabled = Column(Boolean, nullable=False, default=True)
+    # 该机器人的 botpy 桥心跳（每个机器人一个桥容器，各自上报）
+    bridge_last_seen = Column(DateTime, nullable=True)
+    added_at = Column(DateTime, nullable=False, default=_now)
+
+
+class QqBotCapability(Base):
+    """Per-bot delivery capabilities learned from platform responses.
+
+    QQ accounts can differ in whether proactive group delivery is permitted.
+    Keeping this state outside ``qq_bot`` lets existing installations migrate
+    by simply creating one small table and leaves credential rows untouched.
+    """
+    __tablename__ = "qq_bot_capability"
+
+    bot_id = Column(Integer, ForeignKey("qq_bot.id", ondelete="CASCADE"), primary_key=True)
+    proactive_enabled = Column(Boolean, nullable=False, default=True)
+    proactive_error = Column(Text, nullable=True)
+    proactive_disabled_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
 class QqGroup(Base):
     """QQ 官方机器人的目标群。
 
@@ -475,7 +600,11 @@ class QqGroup(Base):
     # /new 只返回比它新的消息；拉取后推进。NULL = 从未拉取过
     last_seen_msg_id = Column(Integer, nullable=True)
     games = Column(JSONNull, nullable=True)
+    themes = Column(JSONNull, nullable=True)
     cursors = Column(JSONNull, nullable=True)
+    # 归属机器人（qq_bot.id）。NULL = 迁移前的存量群，仅在恰好一个
+    # 启用机器人时推送；机器人进群/被 @ 事件会带上归属自动落库
+    bot_id = Column(Integer, nullable=True, index=True)
 
 
 class QqDelivery(Base):
@@ -484,6 +613,9 @@ class QqDelivery(Base):
 
     id = Column(Integer, primary_key=True)
     group_openid = Column(String(64), nullable=False, index=True)
+    bot_id = Column(Integer, nullable=True, index=True)
+    source = Column(String(40), nullable=False, default="legacy")
+    trigger = Column(String(80), nullable=False, default="push")
     message_id = Column(Integer, nullable=True, index=True)  # NULL = 测试消息
     bundle_id = Column(Integer, nullable=True)
     dedup_key = Column(String(80), nullable=True, unique=True)
@@ -574,6 +706,8 @@ class ConversationTurn(Base):
     # 记忆 v2：说话人的可读名（昵称）。落库时快照，注入时免二次查表
     speaker = Column(String(80), nullable=True)
     event_key = Column(String(160), nullable=True, unique=True)
+    source_event_id = Column(String(160), nullable=True)
+    reply_to = Column(String(160), nullable=True)
     created_at = Column(DateTime, nullable=False, default=_now, index=True)
 
     conversation = relationship("Conversation")
@@ -591,6 +725,8 @@ class MemberProfile(Base):
     id = Column(Integer, primary_key=True)
     member_openid = Column(String(80), nullable=False, unique=True, index=True)
     nickname = Column(String(60), nullable=True)
+    scope_data = Column(JSONNull, nullable=True)
+    confirmation = Column(String(20), nullable=False, default="pending")
     facts = Column(JSONNull, nullable=True)
     updated_at = Column(DateTime, nullable=False, default=_now, onupdate=_now)
 
@@ -683,6 +819,9 @@ class ShareToken(Base):
     token_enc = Column(Text, nullable=True)
     # 一图流分享的人工/AI 一句话概括（2026-09）。空 = 未填
     summary = Column(Text, nullable=True)
+    # 消息 id 集合的内容指纹（2026-09）：同内容分享去重复用，命中
+    # bundle_cards 的渲染缓存，重复查询不再重新渲染长图
+    content_key = Column(String(64), nullable=True, index=True)
     created_by = Column(String(60), nullable=False, default="")
     expires_at = Column(DateTime, nullable=False)
     revoked = Column(Boolean, nullable=False, default=False)
@@ -696,6 +835,7 @@ class QqEvent(Base):
     status = Column(String(20), nullable=False, default="processing")
     result = Column(JSONNull, nullable=True)
     parts = Column(JSONNull, nullable=True)
+    reply_deadline = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=False, default=_now, onupdate=_now)
 
 

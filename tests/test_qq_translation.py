@@ -83,6 +83,18 @@ def test_verified_beta_terms_seed_is_idempotent():
     """The concrete HSR beta names are seeded without duplicating corrections."""
     from tgmon.bootstrap import _seed_verified_terms
 
+    # 隔离：admin 应用被 import 时（如 TestClient 触发）init_all 已提前
+    # 种入这批术语。先清掉再断言「首调新建 2 条」，不依赖执行顺序。
+    with session_scope() as s:
+        ids = [e.id for e in s.query(GlossaryEntry)
+               .filter(GlossaryEntry.origin == "verified:hsr-beta").all()]
+        if ids:
+            s.query(GlossaryAlias).filter(
+                GlossaryAlias.entry_id.in_(ids)).delete(synchronize_session=False)
+            s.query(GlossaryEntry).filter(
+                GlossaryEntry.id.in_(ids)).delete(synchronize_session=False)
+    glossary.invalidate_cache()
+
     assert _seed_verified_terms() == 2
     assert _seed_verified_terms() == 0
     with session_scope() as s:
@@ -181,7 +193,7 @@ async def test_cached_translation_repairs_terms_without_calling_provider(monkeyp
 async def test_c2c_reply_preserves_message_sequence(monkeypatch):
     posted = []
 
-    async def post(path, body):
+    async def post(path, body, bot=None):
         posted.append((path, body))
         return "sent"
 

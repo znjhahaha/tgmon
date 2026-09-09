@@ -55,6 +55,13 @@ def resolve_prompt(channel: HasPromptFields | None, game: str | None = None) -> 
     """取该频道生效的 prompt。频道覆盖 > game 层 > 全局。"""
     if channel is not None and (channel.prompt_override or "").strip():
         return channel.prompt_override.strip()
+    theme = getattr(channel, "theme", "gaming") if channel is not None else "gaming"
+    if theme != "gaming":
+        from .themes import get_theme
+        package = get_theme(theme)
+        return (str(package.config.get("prompt") or "") +
+                "\n保留原始排版、数值、链接和代码。只输出简体中文译文。\n" +
+                "\n".join(f"{k}: {v}" for k, v in package.config.get("terms", {}).items()))
 
     key = (game or (channel.game if channel else "") or "").strip()
     with session_scope() as s:

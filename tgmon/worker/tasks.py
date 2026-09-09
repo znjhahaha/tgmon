@@ -18,7 +18,7 @@ from telethon.errors import (
 
 from .. import outputs, settings
 from ..db import session_scope
-from ..models import Channel, MonitorMessage, Task, WorkerState
+from ..models import Channel, MessageMedia, MonitorMessage, Task, WorkerState
 from ..providers import test_provider
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,8 @@ def _action_label(kind: str, payload: dict) -> str:
         return "媒体清理"
     if kind == "retranslate":
         return f"重译消息 {payload.get('message_id')}"
+    if kind == "archive_video":
+        return f"归档视频 {payload.get('channel_id')}/{payload.get('tg_message_id')}"
     if kind == "sync_dialogs":
         return "同步频道列表"
     return f"任务 {kind}"
@@ -105,17 +107,22 @@ def _parse_day(v) -> datetime | None:
 async def _iter_and_ingest(client, cid: int, tg_id: int, *, limit: int,
                            offset_id: int | None = None,
                            min_date: datetime | None = None,
-                           progress_cb=None) -> dict:
+                           progress_cb=None, persistent_cursor: bool = False) -> dict:
     """拉一个频道的历史消息并逐批入库。backfill 与 catch-up 共用。
 
     返回 {"ingested": 入库数, "total": 批次数}。
     progress_cb(done, total) 每处理一批调一次。
     """
-    from .. import pipeline
+    from .. import jobs
+    from ..models import SourceCursor
     entity = await client.get_entity(tg_id)
-
-    groups: dict[str, list] = {}
-    singles: list[list] = []
+    if persistent_cursor:
+        with session_scope() as s:
+            cursor = s.get(SourceCursor, cid)
+            if cursor and not cursor.complete:
+                offset_id, min_date = cursor.offset_id or None, cursor.cutoff
+    messages = []
+    exhausted, oldest, highest = True, offset_id or 0, 0
     # offset_id=None 不能传 —— Telethon 1.38.1 内部会 max(None, 0) 直接炸
     iter_kwargs: dict = {"limit": limit}
     if offset_id:
@@ -124,21 +131,26 @@ async def _iter_and_ingest(client, cid: int, tg_id: int, *, limit: int,
         # msg.date 是 UTC aware；DB 统一 naive，对齐再比
         if min_date and msg.date and msg.date.replace(tzinfo=None) < min_date:
             break
-        if getattr(msg, "grouped_id", None):
-            groups.setdefault(str(msg.grouped_id), []).append(msg)
-        else:
-            singles.append([msg])
-    batches = list(groups.values()) + singles
-    done = 0
-    for batch in batches:
-        try:
-            if await pipeline.ingest(client, cid, batch):
-                done += 1
-        except Exception as e:
-            logger.warning("补历史失败: %s", e)
-        if progress_cb:
-            progress_cb(done, len(batches))
-    return {"ok": True, "ingested": done, "total": len(batches)}
+        messages.append(msg)
+        oldest, highest = min(oldest or msg.id, msg.id), max(highest, msg.id)
+    if len(messages) >= limit:
+        exhausted = False
+    event_ids = await asyncio.to_thread(jobs.save_events, cid, messages)
+    if persistent_cursor:
+        # The page is durable before advancing the cursor. A crash between
+        # these transactions only replays the page, which unique keys absorb.
+        with session_scope() as s:
+            cursor = s.get(SourceCursor, cid)
+            if cursor is None:
+                cursor = SourceCursor(channel_id=cid)
+                s.add(cursor)
+            cursor.offset_id, cursor.high_id = oldest, max(cursor.high_id or 0, highest)
+            cursor.complete, cursor.cutoff = exhausted, min_date
+            cursor.updated_at, cursor.error = datetime.utcnow(), None
+    if progress_cb:
+        progress_cb(len(event_ids), len(messages))
+    return {"ok": True, "ingested": len(event_ids), "total": len(messages),
+            "complete": exhausted, "offset_id": oldest}
 
 
 async def _backfill(runner, payload: dict, task_id: int = 0) -> dict:
@@ -341,7 +353,7 @@ async def _retranslate(runner, payload: dict) -> dict:
 
     payload 里可以带 game 覆盖判定结果，用于后台手工纠正。
     """
-    from .. import classify, glossary, prompts, translate as tr
+    from .. import classify, glossary, lang, prompts, translate as tr
     from ..kb.annotate import annotate_from_hits
 
     mid = int(payload.get("message_id") or 0)
@@ -355,6 +367,7 @@ async def _retranslate(runner, payload: dict) -> dict:
         ch = s.get(Channel, chan_id)
         channel_copy = (SimpleNamespace(
             game=ch.game, games=ch.games or None,
+            theme=ch.theme or "gaming",
             prompt_override=ch.prompt_override,
             bilingual_policy=ch.bilingual_policy or "zh_first")
                          if ch else None)
@@ -363,8 +376,12 @@ async def _retranslate(runner, payload: dict) -> dict:
 
     hits = glossary.find_hits(
         text_raw, glossary.terms_all(langs=("en", "ja", "zh")))
-    det = await classify.resolve_game(text_raw, channel_copy, hits=hits)
-    game = forced_game or det.game or (channel_copy.game if channel_copy else None)
+    if getattr(channel_copy, "theme", "gaming") == "gaming":
+        det = await classify.resolve_game(text_raw, channel_copy, hits=hits)
+    else:
+        det, hits = classify.Detection(), []
+    theme = getattr(channel_copy, "theme", "gaming")
+    game = (forced_game or det.game or (channel_copy.game if channel_copy else None)) if theme == "gaming" else None
     if forced_game:
         det.game, det.method = glossary.normalize_game(forced_game), "manual"
         det.reasons.insert(0, f"后台手工指定 → {forced_game}")
@@ -373,15 +390,27 @@ async def _retranslate(runner, payload: dict) -> dict:
     entities_data = annotate_from_hits(scoped, game)
 
     prompt = prompts.resolve_prompt(channel_copy, game)
-    prompt += prompts.game_context(game)
+    if getattr(channel_copy, "theme", "gaming") == "gaming":
+        prompt += prompts.game_context(game)
     # 绕过缓存读取：重译的意图就是不要旧结果
-    res = await tr.translate(text_raw, prompt, game, entities_data,
-                             use_cache=False, hits=hits,
-                             bilingual_policy=getattr(channel_copy, "bilingual_policy", "zh_first"))
+    policy = getattr(channel_copy, "bilingual_policy", "zh_first")
+    route = lang.route(text_raw, policy=policy,
+        zh_min_chars=int(settings.get("BILINGUAL_ZH_MIN_CHARS") or 10)) if settings.get("LANG_ROUTE_ENABLED") else None
+    if route and not route.translate_text:
+        res = tr.TranslateResult(text_zh=route.keep_text, status="skipped_zh")
+    else:
+        res = await tr.translate(route.translate_text if route else text_raw, prompt, game, entities_data,
+                                 use_cache=bool(payload.get("use_cache")), hits=hits,
+                                 bilingual_policy=policy,
+                                 **({"theme": theme} if theme != "gaming" else {}))
+        if res.status == "ok" and route and route.keep_text:
+            res.text_zh = lang.stitch(route, res.text_zh)
 
     with session_scope() as s:
         row = s.get(MonitorMessage, mid)
         if row is not None:
+            if row.text_raw != text_raw:
+                return {"ok": False, "status": "stale", "error": "Source content changed"}
             row.text_zh = res.text_zh or None
             row.translate_status = res.status
             row.translate_error = res.error
@@ -389,12 +418,15 @@ async def _retranslate(runner, payload: dict) -> dict:
             row.model = res.model
             row.glossary_hits = res.glossary_hits or None
             row.glossary_miss = res.glossary_miss or None
-            row.from_cache = False
+            row.from_cache = res.from_cache
             row.entities = (entities_data or {}).get("entities") or None
             row.game_detected = det.game
             row.game_scores = det.as_json()
             row.topics = det.topics or None
             row.version_tag = det.version
+            s.flush()
+            from ..content import record
+            record(mid, session=s)
     if settings.get("RETRIEVAL_ENABLED"):
         try:
             from ..retrieval import index_message
@@ -460,6 +492,54 @@ async def _media_cleanup(runner, payload: dict) -> dict:
     # 消息 TTL 也挂这里：后台「立即清理」按钮一键清全部超期数据
     r2 = cleanup_messages()
     return {"media": r1, "messages": r2}
+
+
+async def _archive_video(runner, payload: dict) -> dict:
+    """Archive one video outside the ingestion critical path.
+
+    Only this worker touches the Telethon session. The media row is updated
+    after the source has been fetched and the output has been atomically
+    written by ``media._archive_video``.
+    """
+    from .. import media
+
+    media_id = int(payload.get("media_id") or 0)
+    channel_id = int(payload.get("channel_id") or 0)
+    tg_message_id = int(payload.get("tg_message_id") or 0)
+    if not media_id or not channel_id or not tg_message_id:
+        raise ValueError("archive_video payload is incomplete")
+    if runner.client is None:
+        raise RuntimeError("Telegram client is offline")
+    with session_scope() as s:
+        media_row = s.get(MessageMedia, media_id)
+        channel = s.get(Channel, channel_id)
+        if media_row is None or channel is None:
+            raise ValueError("archive_video source no longer exists")
+        if media_row.video_status == "ok" and media_row.video_path:
+            return {"ok": True, "status": "already_done", "media_id": media_id}
+        out = media.MediaOut(
+            kind=media_row.kind, thumb_path=media_row.thumb_path,
+            thumb_bytes=media_row.thumb_bytes, width=media_row.width,
+            height=media_row.height, duration=media_row.duration,
+            orig_bytes=media_row.orig_bytes, mime=media_row.mime,
+            phash=media_row.phash, dhash=media_row.dhash,
+            has_spoiler=media_row.has_spoiler,
+            video_path=media_row.video_path, video_bytes=media_row.video_bytes,
+            video_status=media_row.video_status)
+        tg_id = channel.tg_id
+        max_mb = int(payload.get("video_max_mb") or channel.video_max_mb or 0)
+    entity = await runner.client.get_entity(tg_id)
+    message = await runner.client.get_messages(entity, ids=tg_message_id)
+    if message is None:
+        raise RuntimeError("Telegram video message not found")
+    await media._archive_video(runner.client, message, channel_id, out, max_mb)
+    with session_scope() as s:
+        row = s.get(MessageMedia, media_id)
+        if row is not None:
+            row.video_path, row.video_bytes, row.video_status = (
+                out.video_path, out.video_bytes, out.video_status)
+    return {"ok": out.video_status == "ok", "status": out.video_status,
+            "media_id": media_id}
 
 
 async def _kb_import(runner, payload: dict) -> dict:
@@ -582,6 +662,7 @@ _HANDLERS = {
     "sync_dialogs": _sync_dialogs,
     "test_provider": _test_provider,
     "retranslate": _retranslate,
+    "archive_video": _archive_video,
     "trial_translate": _trial_translate,
     "repush": _repush,
     "restart_worker": _restart_worker,
@@ -599,13 +680,13 @@ _HANDLERS = {
 def claim_next() -> tuple[int, str, dict] | None:
     """取一条 pending 任务并标记 running。"""
     with session_scope() as s:
-        row = (s.query(Task)
-               .filter(Task.status == "pending")
-               .order_by(Task.id.asc()).first())
+        from sqlalchemy import select, update
+        candidate = select(Task.id).where(Task.status == "pending").order_by(Task.id).limit(1).scalar_subquery()
+        row = s.execute(update(Task).where(Task.id == candidate).values(
+            status="running", started_at=datetime.utcnow()).returning(
+            Task.id, Task.kind, Task.payload)).first()
         if row is None:
             return None
-        row.status = "running"
-        row.started_at = datetime.utcnow()
         return row.id, row.kind, dict(row.payload or {})
 
 

@@ -110,6 +110,7 @@
         {{ x.kind }}{% if x.width %} {{ x.width }}×{{ x.height }}{% endif %}
         {% if x.duration %} · {{ x.duration }}s{% endif %}
         {% if x.orig_bytes %} · 原始 {{ x.orig_bytes|human_bytes }}{% endif %}
+        {% if x.error %} · {{ x.error }}{% elif x.status in ('queued', 'downloading', 'archiving', 'waiting_space') %} · {{ {'queued':'等待处理', 'downloading':'下载中', 'archiving':'归档中', 'waiting_space':'等待磁盘空间'}.get(x.status) }}{% endif %}
         {% if x.kind == 'video' %}
           {% if x.video_status == 'ok' and x.video_path %}
             · 已归档（{{ x.video_bytes|human_bytes }}），点缩略图播放

@@ -30,6 +30,10 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     # ---- 翻译 ----
     "TRANSLATE_ENABLED": (True, "bool", "translate", False, False, "总开关"),
     "TRANSLATE_CONCURRENCY": (2, "int", "translate", False, False, "全局并发翻译数"),
+    "AI_CHAT_DEADLINE": (20, "int", "translate", False, False, "聊天请求总截止时间（秒）"),
+    "AI_TRANSLATE_DEADLINE": (90, "int", "translate", False, False, "翻译请求总截止时间（秒）"),
+    "AI_SUMMARY_DEADLINE": (30, "int", "translate", False, False, "摘要请求总截止时间（秒）"),
+    "AI_PURPOSE_PROVIDERS": ({}, "json", "translate", False, False, "按用途排列优先后端名称"),
     "TRANSLATE_CACHE_ENABLED": (True, "bool", "translate", False, False, "同文缓存"),
     "GLOSSARY_CHECK_ENABLED": (True, "bool", "translate", False, False, "译后术语校验"),
     "APPEND_ORIGINAL": (True, "bool", "translate", False, False, "译文后附原文"),
@@ -63,6 +67,7 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     "MEMORY_ENABLED": (True, "bool", "qq", False, False, "QQ 对话记忆"),
     "MEMORY_TTL_DAYS": (30, "int", "qq", False, False, "个人短期记忆保留天数"),
     "MEMORY_RECENT_TURNS": (8, "int", "qq", False, False, "注入最近对话轮数"),
+    "MEMORY_TOKEN_BUDGET": (2048, "int", "qq", False, False, "多轮上下文 token 预算"),
     "MEMORY_SUMMARY_TRIGGER": (12, "int", "qq", False, False, "触发滚动摘要的轮数"),
     "WIKI_SYNC_ENABLED": (True, "bool", "kb", False, False, "Wiki 知识库同步"),
     "WIKI_FETCH_INTERVAL_HOURS": (24, "int", "kb", False, False, "Wiki 同步间隔"),
@@ -102,7 +107,8 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     "THUMB_WIDTH": (640, "int", "media", False, False, "视频缩略图宽"),
     "PHOTO_WIDTH": (1280, "int", "media", False, False, "图片下采样宽"),
     "WEBP_QUALITY": (80, "int", "media", False, False, "WebP 质量"),
-    "MEDIA_TTL_DAYS": (30, "int", "media", False, False, "缩略图保留天数"),
+    "MEDIA_TTL_DAYS": (7, "int", "media", False, False, "媒体保留天数"),
+    "MEDIA_FREE_RESERVE_MB": (256, "int", "media", False, False, "媒体处理预留磁盘空间 MB"),
     "MEDIA_MAX_MB": (2048, "int", "media", False, False, "媒体总量上限（MB），LRU 淘汰"),
     "FFMPEG_FALLBACK": (True, "bool", "media", False, False, "无 thumb 时流式抽首帧"),
     "VIDEO_MAX_MB": (50, "int", "media", False, False, "归档视频源文件大小上限（MB）"),
@@ -111,14 +117,14 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     # 语义按 published_at（消息发布时间）算 —— 对齐窗口 3 天 < TTL 5 天，
     # 补进来的消息不会一入库就过期。副作用：dedup 回看窗口（7 天）
     # 会被截断，第 6 天的转载不再判重 —— 「全删」意图下可接受
-    "MESSAGE_TTL_DAYS": (5, "int", "media", False, False,
+    "MESSAGE_TTL_DAYS": (0, "int", "media", False, False,
                          "消息保留天数（超期连同媒体全删，0=不删）"),
 
     # ---- 视频归档 ----
     # 默认关。开了就会真的下载原片并全片转码 —— 盘只有 13G 可用、内存 3.9G，
     # 这是本项目最烧资源的一条路径，必须由人显式打开
-    "VIDEO_ARCHIVE_ENABLED": (False, "bool", "video", False, False, "视频归档总开关"),
-    "VIDEO_MAX_SECONDS": (180, "int", "video", False, False, "超过此时长不归档"),
+    "VIDEO_ARCHIVE_ENABLED": (True, "bool", "video", False, False, "视频归档总开关"),
+    "VIDEO_MAX_SECONDS": (0, "int", "video", False, False, "归档时长限制，0=不限"),
     "VIDEO_HEIGHT": (720, "int", "video", False, False, "转码目标高度"),
     "VIDEO_CRF": (28, "int", "video", False, False, "x264 CRF，越大越小越糊"),
     "VIDEO_TTL_DAYS": (7, "int", "video", False, False, "归档视频保留天数"),
@@ -136,6 +142,7 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     # ---- QQ 官方机器人 ----
     # 群推送出站。AppID/AppSecret 在 q.qq.com 创建机器人后获得
     "QQ_ENABLED": (False, "bool", "qq", False, False, "QQ 群推送总开关"),
+    "QQ_REPLY_WINDOW_SECONDS": (300, "int", "qq", False, False, "当前账户被动回复有效期秒数"),
     "QQ_APP_ID": ("", "str", "qq", False, False, "q.qq.com 的机器人 AppID"),
     # 「机器人密钥」= Bot Secret。API 鉴权与 Webhook 回调验签**共用**它，
     # 不要再为验签单开配置项 —— 填成「机器人令牌」会让回调校验静默失败
@@ -143,8 +150,9 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     # 留空 = 全部频道；否则 channel id 列表（JSON）
     "QQ_CHANNEL_IDS": ([], "json", "qq", False, False, "只推这些频道，留空=全部"),
     "QQ_INCLUDE_DUPS": (False, "bool", "qq", False, False, "重复消息也推"),
-    # 每群每日软上限。平台硬限 1000/天，留余量防测试消息也计入硬限
-    "QQ_DAILY_LIMIT": (950, "int", "qq", False, False, "每群每日推送上限（平台硬限 1000）"),
+    # Operator budget only. Account permissions and platform limits come from API feedback.
+    "QQ_DAILY_LIMIT": (0, "int", "qq", False, False, "每群每日推送预算，0 不设本地上限"),
+    # 每个机器人收到无权限错误后由发送链路单独熔断，不影响被动回复。
     # ---- botpy WS 事件桥 ----
     # botpy 容器转发事件到 admin /qqbot/bridge 的鉴权令牌。空 = 桥未启用。
     # 生成：管理页「重新生成桥令牌」按钮，或服务器上 secrets.token_hex(16)
@@ -152,7 +160,15 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
                         "botpy WS 事件桥的鉴权令牌（桥容器 env 的 BRIDGE_TOKEN）"),
     # 桥心跳时间戳（ISO 格式，UTC）。管理页「桥在线」判定依据，自动维护
     "QQ_BRIDGE_LAST_SEEN": ("", "str", "qq", False, False,
-                            "桥最后心跳时间（自动维护，勿手改）"),
+                        "桥最后心跳时间（自动维护，勿手改）"),
+    # ---- 通用主题与扩展 ----
+    "THEME_DEFAULT": ("gaming", "str", "general", False, False, "默认主题包"),
+    "PLUGIN_ENABLED": (True, "bool", "general", False, False, "允许本地插件宿主"),
+    "PLUGIN_ROOT": ("", "str", "general", False, False, "本地插件目录"),
+    "PLUGIN_WORKER_STATUS": ({}, "json", "general", False, False, "worker 插件宿主状态"),
+    "MCP_ENABLED": (False, "bool", "general", False, False, "启用 MCP 外部工具"),
+    "MCP_SERVERS": ([], "json", "general", True, False, "MCP stdio / HTTP 服务配置"),
+    "MCP_BOT_TOOLS": ({}, "json", "general", False, False, "按机器人 AppID 授权外部工具"),
     # ---- QQ 群内 AI ----
     # 群/C2C 的 AI 对答总开关（细粒度的触发策略见 QQ_AI_FALLBACK）
     "QQ_AI_ENABLED": (True, "bool", "qq", False, False, "群内 AI 对话开关"),
@@ -171,11 +187,6 @@ DEFAULTS: dict[str, tuple[Any, str, str, bool, bool, str]] = {
     # /latest 默认拉几条；明确请求最多 5 条，内容会合并为长图和链接
     "QQ_LATEST_DEFAULT_N": (3, "int", "qq", False, False,
                              "/latest 默认条数（1-5）"),
-    # 每日召回摘要：每天 21:00 给当天互动过的群发当日汇总（is_wakeup，
-    # 群聊支持性需实测，失败自动停用）
-    "QQ_DAILY_DIGEST_ENABLED": (False, "bool", "qq", False, False,
-                                  "每日召回摘要开关"),
-
     # ---- QQ 图片中转（GitHub） ----
     # 背景：平台富媒体上传是腾讯机房来拉 URL，拉不动境外小站（本站 850027
     # 超时），但 GitHub raw 实测可达。图片经 GitHub 公开仓库中转。

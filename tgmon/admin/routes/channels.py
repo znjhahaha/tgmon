@@ -11,6 +11,8 @@ from fastapi.responses import HTMLResponse
 
 from ...db import session_scope
 from ...models import Channel, MonitorMessage
+from ...paths import EXTENSIONS_DIR
+from ...themes import load_themes
 from ...util import opt_int
 from ...settings import get as _cfg_get
 from ..deps import (
@@ -20,6 +22,26 @@ from ..deps import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/channels")
+
+
+def _last_catchup_channels() -> dict[int, dict]:
+    """最近一轮对齐的分频道明细（runner 写进 Task.result.channels）。
+
+    {"cid": {...明细...}}。没有对齐记录（worker 从未跑过）返回空。
+    """
+    from ...models import Task
+    with session_scope() as s:
+        t = (s.query(Task)
+             .filter(Task.kind == "catchup_round",
+                     Task.status == "done",
+                     Task.result.isnot(None))
+             .order_by(Task.id.desc()).first())
+        if t is None or not t.result:
+            return {}
+        chans = (t.result or {}).get("channels") or {}
+        # JSON 键是字符串（JSONNull 列），频道侧按 int 匹配
+        return {int(k): v for k, v in chans.items()
+                if isinstance(v, dict)}
 
 
 def _list(q: str = "", only_on: bool = False) -> list[dict]:
@@ -41,6 +63,7 @@ def _list(q: str = "", only_on: bool = False) -> list[dict]:
             MonitorMessage.channel_id,
             func.max(cast(MonitorMessage.tg_message_id, Integer)))
             .group_by(MonitorMessage.channel_id).all())
+        last_round = _last_catchup_channels()
         out = []
         for r in rows:
             d = {
@@ -61,6 +84,7 @@ def _list(q: str = "", only_on: bool = False) -> list[dict]:
                 "last_tg_id": r.last_tg_id,
                 "last_catchup_at": r.last_catchup_at,
                 "db_max_tg": maxes.get(r.id),
+                "last_round": last_round.get(r.id),
             }
             # 落后条数：TG 侧见到的最新 - 已入库最新（None = 还没对账过）
             d["catchup_gap"] = (d["last_tg_id"] - d["db_max_tg"]
@@ -116,6 +140,7 @@ async def edit_page(cid: int, request: Request,
             "id": r.id, "tg_id": r.tg_id, "username": r.username,
             "source_type": r.source_type, "title": r.title,
             "enabled": r.enabled, "game": r.game or "",
+            "theme": r.theme or "gaming",
             "games": r.games or [],
             "prompt_override": r.prompt_override or "",
             "force_push": r.force_push, "translate": r.translate,
@@ -129,6 +154,7 @@ async def edit_page(cid: int, request: Request,
         }
     return render(request, "channels_edit.html", {
         "nav_active": "channels", "c": c, "games": _games(),
+        "themes": load_themes(EXTENSIONS_DIR / "themes"),
         "backfill_default": int(_cfg_get("BACKFILL_LIMIT") or 20),
         "align_days": int(_cfg_get("ALIGN_WINDOW_DAYS") or 3),
     })
@@ -171,6 +197,7 @@ async def toggle(cid: int, request: Request, user: str = Depends(require_admin))
 @router.post("/{cid}/save")
 async def save(cid: int, request: Request,
                game: str = Form(""),
+               theme: str = Form("gaming"),
                games: str = Form(""),
                prompt_override: str = Form(""),
                translate: str = Form(""),
@@ -203,6 +230,7 @@ async def save(cid: int, request: Request,
         if row is None:
             return redirect("/channels")
         row.game = game.strip() or None
+        row.theme = theme.strip() or "gaming"
         row.games = games_list
         row.prompt_override = prompt_override.strip() or None
         row.translate = flag(translate)

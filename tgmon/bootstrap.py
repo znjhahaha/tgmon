@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 def init_all() -> None:
+    from filelock import FileLock
+    from .paths import DB_PATH
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(DB_PATH.parent / "migration.lock"), timeout=180):
+        _init_all()
+
+
+def _init_all() -> None:
     from .unified_migration import backup_before_upgrade
     backup_before_upgrade()
     Base.metadata.create_all(engine)
@@ -46,6 +54,43 @@ def init_all() -> None:
         logger.info("Wiki 无效候选已拒绝: %s", repaired)
     from .unified_migration import migrate
     migrate()
+    _migrate_qq_bots()
+    from .general_migration import migrate as migrate_general
+    migrate_general()
+
+
+def _migrate_qq_bots() -> None:
+    """多机器人迁移（幂等）：旧配置 QQ_APP_ID / QQ_APP_SECRET 导入 qq_bot 首行。
+
+    存量部署只有一对凭据 —— 导入后所有 bot_id 为 NULL 的群都归属它，
+    单机器人行为零变化。表已有行或旧配置为空则跳过。
+    """
+    from .crypto import decrypt, encrypt
+    from .models import AppSetting, QqBot, QqGroup
+
+    with session_scope() as s:
+        if s.query(QqBot.id).first() is not None:
+            return
+        row = s.query(AppSetting).filter_by(key="QQ_APP_ID").first()
+        secret_row = s.query(AppSetting).filter_by(key="QQ_APP_SECRET").first()
+        app_id = (row.value or "").strip() if row is not None else ""
+        secret = ""
+        if secret_row is not None and secret_row.value:
+            try:
+                secret = decrypt(secret_row.value)
+            except Exception:
+                secret = secret_row.value
+        if not app_id or not secret:
+            return
+        bot = QqBot(app_id=app_id, nickname="默认机器人",
+                    app_secret_enc=encrypt(secret))
+        s.add(bot)
+        s.flush()
+        n = (s.query(QqGroup)
+             .filter(QqGroup.bot_id.is_(None))
+             .update({"bot_id": bot.id}, synchronize_session=False))
+        logger.info("QQ 凭据已迁移到多机器人表（app_id=%s，归属群 %d 个）",
+                    app_id, n)
 
 
 def _ensure_retrieval_fts() -> None:
@@ -77,6 +122,10 @@ def _ensure_retrieval_fts() -> None:
 # SQLite 的 ALTER TABLE ADD COLUMN 足够，为这点改动引入迁移框架不值得。
 # 格式：表名 -> [(列名, SQL 类型与默认值)]
 _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "source_cursor": [("state", "TEXT")],
+    "member_profile": [("scope_data", "TEXT"),
+                       ("confirmation", "VARCHAR(20) NOT NULL DEFAULT 'pending'")],
+    "processing_job": [("scope_key", "VARCHAR(160)")],
     "knowledge_source": [
         ("trusted", "BOOLEAN NOT NULL DEFAULT 0"),
         ("kind", "VARCHAR(24) NOT NULL DEFAULT 'wiki'"),
@@ -85,11 +134,13 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("context_state", "TEXT"), ("revision", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "conversation_turn": [
+        ("source_event_id", "VARCHAR(160)"), ("reply_to", "VARCHAR(160)"),
         ("actor_id", "VARCHAR(80)"), ("event_key", "VARCHAR(160)"),
         # 记忆 v2：说话人昵称快照
         ("speaker", "VARCHAR(80)"),
     ],
     "channel": [
+        ("theme", "VARCHAR(64) NOT NULL DEFAULT 'gaming'"),
         ("bilingual_policy", "VARCHAR(20) NOT NULL DEFAULT 'zh_first'"),
         ("games", "TEXT"),             # JSON 在 SQLite 里就是 TEXT
         ("video_max_mb", "INTEGER NOT NULL DEFAULT 0"),
@@ -97,6 +148,7 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("last_catchup_at", "DATETIME"),
     ],
     "monitor_message": [
+        ("theme", "VARCHAR(64) NOT NULL DEFAULT 'gaming'"),
         ("lang_detected", "VARCHAR(8)"),
         ("text_dropped", "TEXT"),
         ("entities", "TEXT"),          # JSON 在 SQLite 里就是 TEXT
@@ -112,6 +164,10 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("video_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("video_status", "VARCHAR(20)"),
         ("has_spoiler", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("source_tg_id", "VARCHAR(80)"), ("source_identity", "VARCHAR(160)"),
+        ("status", "VARCHAR(24) NOT NULL DEFAULT 'ready'"), ("error", "TEXT"),
+        ("sha256", "VARCHAR(64)"), ("original_path", "VARCHAR(300)"),
+        ("original_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "admin_user": [
         ("role", "VARCHAR(10) NOT NULL DEFAULT 'admin'"),
@@ -120,9 +176,12 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("current_action", "VARCHAR(200) DEFAULT ''"),
     ],
     "qq_group": [
+        ("themes", "TEXT"),
         ("games", "TEXT"), ("cursors", "TEXT"),
         # /new 未读增量的群维度已读游标（2026-09 QQ 命令升级）
         ("last_seen_msg_id", "INTEGER"),
+        # 多机器人：群归属（qq_bot.id）。NULL = 迁移前存量，仅单机器人时推送
+        ("bot_id", "INTEGER"),
     ],
     "share_token": [
         ("snapshot_items", "TEXT"),
@@ -132,6 +191,8 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("message_ids", "TEXT"),       # JSON 数组，null = 单条
         # 2026-09 一图流分享：一句话概括（人工输入 / AI 生成）
         ("summary", "TEXT"),
+        # 2026-09 分享去重：消息 id 集合内容指纹，同内容复用缓存
+        ("content_key", "VARCHAR(64)"),
     ],
     "knowledge_page": [
         ("document_status", "VARCHAR(12) NOT NULL DEFAULT 'pending'"),
@@ -146,8 +207,11 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("embedding_model", "VARCHAR(120)"),
     ],
     "qq_delivery": [
+        ("bot_id", "INTEGER"), ("source", "VARCHAR(40) NOT NULL DEFAULT 'legacy'"),
+        ("trigger", "VARCHAR(80) NOT NULL DEFAULT 'push'"),
         ("bundle_id", "INTEGER"), ("dedup_key", "VARCHAR(80)"), ("parts", "TEXT"),
     ],
+    "qq_event": [("reply_deadline", "DATETIME")],
 }
 
 

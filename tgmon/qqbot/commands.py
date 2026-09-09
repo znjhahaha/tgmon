@@ -50,7 +50,8 @@ logger = logging.getLogger(__name__)
 MAX_TEXT = 1800
 # 被动回复每条 @ 消息最多 5 次（平台限制），长图查询会把多条内容合并到卡片内
 MAX_REPLIES = 5
-LATEST_MAX = 5
+# 单次查询条数上限（2026-09 用户要求 5→10；超过会明确报错而不是静默截断）
+LATEST_MAX = 10
 
 DEFAULT_AI_SYSTEM = (
     "你是 tgmon 群助手，一个游戏资讯推送机器人的对话人格。"
@@ -61,7 +62,7 @@ DEFAULT_AI_SYSTEM = (
 HELP_TEXT = (
     "我是 tgmon 机器人，可以这样吩咐我：\n"
     "/help - 本帮助\n"
-    "/latest 3 - 最新 3 条爆料（带图，数字可改 1-5）\n"
+    "/latest 3 - 最新 3 条爆料（带图，数字可改 1-10）\n"
     "/new - 只看本群还没看过的新消息\n"
     "/search 关键词 - 搜索爆料\n"
     "/ask 问题 - 根据爆料回答（带引用）\n"
@@ -120,6 +121,39 @@ def _clip(replies: list[Reply]) -> list[Reply]:
     return kept
 
 
+def _over_limit_reply() -> Reply:
+    """条数超上限的明确报错（2026-09：不再静默截断）。"""
+    return Reply(text=f"一次最多 {LATEST_MAX} 条；想看更多用「继续」往下翻。")
+
+
+def _pack_text_replies(rows: list[dict]) -> list[Reply]:
+    """文字版打包：多条 _fmt_row 按 MAX_TEXT 聚合，总量守在被动回复
+    5 次上限内（2026-09 条数上限提到 10 后的配套 —— 否则 10 条文字
+    会被截到 5 条丢内容）。story_ids 跟随各自 chunk，记忆游标不丢。"""
+    chunks: list[str] = []
+    buf: list[str] = []
+    ids: list[list[int]] = []
+    buf_ids: list[list[int]] = []
+    for row in rows:
+        line = _fmt_row(row)
+        candidate = "\n\n".join(buf + [line])
+        if buf and len(candidate) > MAX_TEXT:
+            chunks.append("\n\n".join(buf))
+            ids.append([x for lst in buf_ids for x in lst])
+            buf, buf_ids = [line], [[row["id"]]]
+        else:
+            buf.append(line)
+            buf_ids.append([row["id"]])
+    if buf:
+        chunks.append("\n\n".join(buf))
+        ids.append([x for lst in buf_ids for x in lst])
+    out = [Reply(text=c, story_ids=sids) for c, sids in list(zip(chunks, ids))[:MAX_REPLIES]]
+    if len(chunks) > MAX_REPLIES:
+        out[-1] = Reply(text="（内容太多被截断，缩小范围或用 /peek 消息id 看单条）",
+                        story_ids=ids[MAX_REPLIES - 1])
+    return out
+
+
 def _clean_content(raw: str) -> str:
     """清洗群 @ 消息 content：去显式 @ 片段、前导空格与裸 @ 前缀。"""
     t = (raw or "").strip()
@@ -145,6 +179,12 @@ def _record_conversation(group: str, member: str, content: str,
                 record_turn(group, member, "assistant", reply.text, event_id=event_id, ordinal=i)
     except Exception:
         logger.debug("记录 QQ 记忆失败", exc_info=True)
+
+
+def record_confirmed_conversation(group: str, member: str, content: str,
+                                  replies: list[Reply], event_id: str) -> None:
+    """Commit assistant turns only after every reply part was acknowledged."""
+    _record_conversation(group, member, content, replies, event_id)
 
 
 def _bridge_online() -> bool:
@@ -176,6 +216,11 @@ _COUNT_WITH_UNIT = re.compile(r"(?<![\d.])" + _COUNT + r"\s*(?:条|篇|则|个)"
 def _requested_count(content: str, default: int | None = None) -> int | None:
     """Parse explicit counts; the caller applies the story limit."""
     text = unicodedata.normalize("NFKC", content or "").strip()
+    # 「/latest 10 文字版」类后缀剥掉再解析（2026-09：文字版跟随条数上限）
+    text = re.sub(r"(?:文字版|用文字)\s*$", "", text).strip()
+    # 「10-20条」区间表述取小值（2026-09 群反馈：倒数/区间说法）
+    text = re.sub(r"(\d{1,3})\s*[-–~～至到]\s*(\d{1,3})",
+                  lambda m: str(min(int(m.group(1)), int(m.group(2)))), text)
     match = _COUNT_WITH_UNIT.search(text)
     if not match and re.match(r"^(?:/(?:latest|game|游戏)|最新|最近)\b", text, re.I):
         match = re.search(r"\s" + _COUNT + r"$", text)
@@ -189,7 +234,16 @@ def _natural_latest_request(content: str) -> tuple[str, int] | None:
     """Recognize complete latest-story requests; leave substantive questions to AI."""
     from ..glossary import _GAME_ALIASES
     folded = re.sub(r"\s+", "", unicodedata.normalize("NFKC", content).casefold())
-    if folded.startswith("/") or not re.search(r"最新|最近|近期|爆料|消息|资讯", folded):
+    # 窄口径错字规整（2026-09 并发超时复盘）：只收同音/形近的高频错字，
+    # 让"最进的2条爆料"这类输入直走命令路径，省 2 次 AI 调用。
+    # 规整只影响本函数内的匹配串，不改原始 content（计数仍从原文取）。
+    folded = re.sub(r"最进|最薪", lambda m: "最近" if m.group(0) == "最进" else "最新", folded)
+    folded = folded.replace("进期", "近期").replace("报料", "爆料")
+    # 区间表述取小值（与 _requested_count 同一套规则）
+    folded = re.sub(r"(\d{1,3})[-–~～至到](\d{1,3})",
+                    lambda m: str(min(int(m.group(1)), int(m.group(2)))), folded)
+    # baoliao：群里高频拼音写法（2026-09 群实录「10条baoliao」）
+    if folded.startswith("/") or not re.search(r"最新|最近|近期|爆料|消息|资讯|baoliao", folded):
         return None
     aliases = {unicodedata.normalize("NFKC", key): value for key, value in _GAME_ALIASES.items()}
     aliases.update({game: game for game in _GAME_ALIASES.values()})
@@ -205,14 +259,16 @@ def _natural_latest_request(content: str) -> tuple[str, int] | None:
     remaining = _COUNT_WITH_UNIT.sub("", remaining)
     remaining = re.sub(
         r"发给我|给我发|给我|帮我|麻烦|请|能不能|可以|发送|推送|发|来|看看|看一下|看下|看|"
-        r"查询|查一下|查|一下|最新|最近|近期|爆料|消息|资讯|内容|有什么|有哪些|"
-        r"全部游戏|所有游戏|全部|所有|今天|现在|的|吗|呢|吧|新|有", "", remaining)
+        r"查询|查一下|查|查看|关于|就是|倒数|一下|最新|最近|近期|爆料|消息|资讯|内容|有什么|有哪些|"
+        r"全部游戏|所有游戏|全部|所有|今天|现在|的|吗|呢|吧|新|有|baoliao", "", remaining)
     remaining = re.sub(r"[,。!?：:、\[\]【】]", "", remaining)
     if remaining or len(games) > 1:
         return None
     default = int(settings.get("QQ_LATEST_DEFAULT_N") or 3)
     count = _requested_count(content, default)
-    return next(iter(games), ""), max(1, min(count, LATEST_MAX))
+    # 上限不在截断这里：返回原始 count，调用方（/latest、/game 命令
+    # 路径）会对超限给出明确报错（2026-09 要求不再静默截断）
+    return next(iter(games), ""), max(1, count)
 
 
 
@@ -240,9 +296,10 @@ def mark_read(openid: str, mids: list[int]) -> None:
         cursors = dict(group.cursors or {})
         for row in rows:
             value = {"published_at": (row["published_at"] or datetime.min).isoformat(), "id": row["id"]}
-            previous = cursors.get(row["game"], {})
+            cursor_key = row["game"] if row.get("theme", "gaming") == "gaming" else f"theme:{row['theme']}"
+            previous = cursors.get(cursor_key, {})
             if (value["published_at"], value["id"]) > (previous.get("published_at", ""), previous.get("id", 0)):
-                cursors[row["game"]] = value
+                cursors[cursor_key] = value
         group.cursors = cursors
     _advance_cursor(openid, rows)
 
@@ -263,10 +320,20 @@ def _fmt_row(r: dict, with_id: bool = True) -> str:
 def _row_reply(row: dict) -> Reply:
     """Keep a message's caption and complete album in one QQ media reply."""
     photos = row.get("photos") or []
+    text = _fmt_row(row)
+    # 视频不进长图（compose_album 只拼 photo）。没有提示行的话，/latest
+    # /search 里含视频的消息只剩图片，视频静默丢失（2026-09 群反馈）。
+    # 已归档 → /video 拉原片；未归档 → 给 TG 深链。
+    if any(x.get("kind") == "video" for x in row.get("media") or []):
+        if row.get("video_mid"):
+            hint = f"🎥 含视频：/video {row['video_mid']} 拉原片"
+        else:
+            hint = f"🎥 含视频（未归档）：去 TG 看 {row.get('deeplink') or '原频道'}"
+        text = f"{text}\n{hint}" if text else hint
     if photos:
-        return Reply(kind="image", text=_fmt_row(row), thumb_path=photos[0],
+        return Reply(kind="image", text=text, thumb_path=photos[0],
                      thumb_paths=list(photos), story_ids=[row["id"]])
-    return Reply(text=_fmt_row(row), story_ids=[row["id"]])
+    return Reply(text=text, story_ids=[row["id"]])
 
 
 # ---------------- 命令实现 ----------------
@@ -287,25 +354,28 @@ def _cmd_status() -> list[Reply]:
 
 
 def _cmd_latest(content: str, openid: str) -> list[Reply]:
-    n = int(settings.get("QQ_LATEST_DEFAULT_N") or 3)
-    n = _requested_count(content, n) or n
-    n = max(1, min(n, LATEST_MAX))
+    default = int(settings.get("QQ_LATEST_DEFAULT_N") or 3)
+    n = _requested_count(content, default) or default
+    if n > LATEST_MAX:
+        return [_over_limit_reply()]
+    n = max(1, n)
     rows = _query_latest(n)
     if not rows:
         return [Reply(text="还没有收录任何消息。")]
-    out: list[Reply] = []
-    for i, r in enumerate(rows, 1):
-        out.append(_row_reply(r))
-    return _clip(out)
+    # 不在这里 _clip：多条消息会进尾段合并成长图/打包文字版，
+    # 数据收集阶段截断会让 6-10 条的请求只剩前 5 条（2026-09 bug）
+    return [_row_reply(r) for r in rows]
 
 
 def _cmd_new(openid: str) -> list[Reply]:
     """未读增量：比该群游标（上次拉取的最新一条）更新 的消息。"""
-    from sqlalchemy import and_, or_
-    from ..message_query import query, effective_game, project
+    from sqlalchemy import and_, or_, case, literal
+    from ..message_query import query, effective_game, project_many
     with session_scope() as s:
         group = s.query(QqGroup).filter_by(group_openid=openid).first()
         q = query(s)
+        current_game = case((MonitorMessage.theme != "gaming", literal("theme:") + MonitorMessage.theme),
+                            else_=func.coalesce(effective_game(), ""))
         cursor_filters = []
         for game, cursor in ((group.cursors if group else {}) or {}).items():
             try:
@@ -313,12 +383,10 @@ def _cmd_new(openid: str) -> list[Reply]:
                 mid = int(cursor["id"])
             except (ValueError, KeyError, TypeError):
                 continue
-            current_game = func.coalesce(effective_game(), "")
             cursor_filters.append(and_(current_game == game, or_(
                 MonitorMessage.published_at > stamp,
                 and_(MonitorMessage.published_at == stamp, MonitorMessage.id > mid))))
         if cursor_filters:
-            current_game = func.coalesce(effective_game(), "")
             tracked = tuple((group.cursors if group else {}).keys())
             # A newly subscribed or newly classified game has no cursor yet;
             # include it as unread instead of letting one existing game's
@@ -326,8 +394,10 @@ def _cmd_new(openid: str) -> list[Reply]:
             q = q.filter(or_(*cursor_filters, ~current_game.in_(tracked)))
         if group and group.games:
             q = q.filter(effective_game().in_(group.games))
-        rows = [project(s, m) for m in q.order_by(MonitorMessage.published_at.desc(),
-                                                MonitorMessage.id.desc()).limit(LATEST_MAX)]
+        if group and group.themes:
+            q = q.filter(MonitorMessage.theme.in_(group.themes))
+        rows = project_many(s, q.order_by(MonitorMessage.published_at.desc(),
+                                          MonitorMessage.id.desc()).limit(LATEST_MAX).all())
     return [_row_reply(row) for row in rows] or [Reply(text="没有新消息。")]
 
 
@@ -402,7 +472,7 @@ async def _cmd_ask(question: str, group_openid: str, member_openid: str) -> list
     from ..message_query import by_ids
     ctx = memory.load_context(group_openid, member_openid)
     state = ctx.get("state") or {}
-    hits = search(question, game=state.get("game") or None, limit=8)
+    hits = await asyncio.to_thread(search, question, game=state.get("game") or None, limit=8)
     if any(word in question for word in ("她", "他", "它", "这条", "上一条", "继续")):
         for row in by_ids(state.get("last_message_ids") or []):
             if not any(h.ref_type == "message" and h.ref_id == row["id"] for h in hits):
@@ -418,8 +488,9 @@ async def _cmd_ask(question: str, group_openid: str, member_openid: str) -> list
               "每个事实标注资料中的【消息#id】或【Wiki#id】引用。无证据则说明不确定。"
               "按发言人理解近期对话，不把其他人的偏好当成当前用户的偏好。")
     res = await registry.complete_with_failover(system,
-        "问题：" + question + "\n" + memory.build_chat_context(group_openid, member_openid)
-        + "\n证据：\n" + build_context(hits))
+        "问题：" + question + "\n" + memory.build_chat_context(group_openid, member_openid, include_recent=False)
+        + "\n证据：\n" + build_context(hits),
+        messages=memory.chat_messages(group_openid, member_openid), purpose="chat")
     if not res.ok:
         return [Reply(text="AI 暂时不可用，稍后再试。")]
     record_usage(res.provider_name, res.tokens_in, res.tokens_out,
@@ -441,7 +512,9 @@ def _cmd_game(content: str) -> list[Reply]:
     name = " ".join(parts[1:])
     name = re.sub(r"\s+" + _COUNT + r"(?:\s*(?:条|篇|则|个))?$", "", name).strip()
     n = _requested_count(content, 3) or 3
-    n = max(1, min(n, LATEST_MAX))
+    if n > LATEST_MAX:
+        return [_over_limit_reply()]
+    n = max(1, n)
     rows = _query_latest(n, game=name)
     if not rows:
         # 游戏名可能是别名（如"绝区零"vs"ZZZ"），做一次模糊
@@ -456,9 +529,9 @@ def _cmd_game(content: str) -> list[Reply]:
                             + "、".join(names)
                             + "，换个名字再试。")]
         return [Reply(text=f"没有「{name}」的记录。")]
-    # The outer dispatcher turns story replies into one immutable long-card
-    # bundle. A heading here would consume one of the five reply slots.
-    return _clip([_row_reply(r) for r in rows])
+    # 不在这里 _clip（同 _cmd_latest，2026-09）：多条消息进尾段合并成
+    # 长图/打包文字版，数据收集阶段截断会让 6-10 条的请求丢内容
+    return [_row_reply(r) for r in rows]
 
 
 def _cmd_peek(content: str) -> list[Reply]:
@@ -473,9 +546,6 @@ def _cmd_peek(content: str) -> list[Reply]:
     if r is None:
         return [Reply(text=f"#{mid} 不存在（可能已被清理）。")]
     out = [_row_reply(r)]
-    if r["video_mid"]:
-        out.append(Reply(text=f"视频：/video {r['video_mid']}，"
-                              f"或去 TG 看 {r['deeplink']}"))
     return _clip(out)
 
 
@@ -540,9 +610,10 @@ async def _ai(question: str, group: str = "", member: str = "") -> str:
     system = str(settings.get("QQ_AI_SYSTEM") or "").strip() or DEFAULT_AI_SYSTEM
     from ..providers import registry
     from .. import memory
-    ctx = memory.build_chat_context(group, member)
+    ctx = memory.build_chat_context(group, member, include_recent=False)
     res = await registry.complete_with_failover(system,
-        (ctx + "\n" if ctx else "") + "当前消息：" + question)
+        (ctx + "\n" if ctx else "") + "当前消息：" + question,
+        messages=memory.chat_messages(group, member), purpose="chat")
     if not res.ok:
         log_event("warning", "qqbot", f"群内 AI 调用失败: {res.error}")
         return "AI 暂时不可用，稍后再试。"
@@ -608,17 +679,17 @@ async def _dispatch_raw(content: str, openid: str, in_group: bool,
     translate_cmd = re.match(r"^(?:/translate|/tr|翻译)(?=$|\s|[:：\[【\"“])", content, re.I)
     if translate_cmd:
         return await _cmd_translate(content[translate_cmd.end():].lstrip(" \t\r\n:："))
-    if low.startswith("/latest") or re.fullmatch(r"最新(?:\s+[1-5])?", low):
+    if low.startswith("/latest") or re.fullmatch(r"最新(?:\s+(?:10|[1-9]))?", low):
         return _cmd_latest(content, openid)
     if low in ("/new", "/未读", "未读"):
         return _cmd_new(openid) if in_group and openid \
             else [Reply(text="这条命令要在群里用。")]
     if low.startswith("/search") or low.startswith("搜索"):
-        return _cmd_search(content)
+        return await asyncio.to_thread(_cmd_search, content)
     if low.startswith("/related") or low.startswith("相关"):
-        return _cmd_related(content)
+        return await asyncio.to_thread(_cmd_related, content)
     if low.startswith("/timeline") or low.startswith("时间线"):
-        return _cmd_timeline(content)
+        return await asyncio.to_thread(_cmd_timeline, content)
     if low.startswith("/ask") or low.startswith("问"):
         parts = content.split(maxsplit=1)
         return await _cmd_ask(parts[1].strip() if len(parts) > 1 else "", openid, member_openid)
@@ -643,7 +714,10 @@ async def _dispatch_raw(content: str, openid: str, in_group: bool,
         return [Reply(text="用法：/nickname 昵称（或直接对我说“叫我XX”）", memory_skip=True)]
     if low.startswith("/game") or low.startswith("/游戏"):
         return _cmd_game(content)
-    if low.startswith("/peek") or low.startswith("查看"):
+    if low.startswith("/peek") or re.match(r"^查看\s*#?\d{1,7}\s*$", content.strip()):
+        # 「查看」只有紧跟消息 id 才算 peek（2026-09 群反馈：
+        # 「查看最近的10条爆料」「查看关于zzz的10条爆料」被截胡
+        # 成 peek 用法提示）；其余「查看…」让给 latest 解析 / AI 路由
         return _cmd_peek(content)
     if low.startswith("/video") or low.startswith("视频"):
         return await _cmd_video(content)
@@ -657,6 +731,15 @@ async def _dispatch_raw(content: str, openid: str, in_group: bool,
         q = content[3:].strip()
         return [Reply(text=await _ai(q, openid, member_openid) if q else "用法：/ai <问题>")]
     if low.startswith("/"):
+        from ..extension_runtime import command
+        try:
+            result = await command(content, {"group": openid, "member": member_openid})
+            if result is not None:
+                text = result.get("text", "") if isinstance(result, dict) else str(result)
+                return [Reply(text=str(text)[:MAX_TEXT])]
+        except Exception:
+            logger.warning("插件命令执行失败", exc_info=True)
+            return [Reply(text="该插件暂时不可用。")]
         name = content.split()[0]
         return [Reply(text=f"不认识的命令 {name}，/help 看列表。")]
     # 非命令 → agent 意图路由（可配置退回纯 AI 聊天）
@@ -669,7 +752,8 @@ async def _dispatch_raw(content: str, openid: str, in_group: bool,
 
 
 async def _dispatch(content: str, openid: str, in_group: bool,
-                    member_openid: str = "") -> list[Reply]:
+                    member_openid: str = "", *,
+                    msg_id: str = "", bot: dict | None = None) -> list[Reply]:
     from .. import memory
     from ..glossary import normalize_game
     from ..message_query import by_ids
@@ -687,31 +771,37 @@ async def _dispatch(content: str, openid: str, in_group: bool,
         parts = content[len("修改记忆"):].strip().split("=>", 1)
         if len(parts) != 2 or not all(x.strip() for x in parts):
             return [Reply(text="请给出旧内容和新内容，用 => 分开。", memory_skip=True)]
-        from ..member_profile import add_fact, forget_fact
-        forget_fact(member_openid, parts[0].strip())
-        memory.forget("user", member_openid, parts[0].strip(), group=openid)
-        add_fact(member_openid, parts[1].strip())
-        return [Reply(text="记忆已更新。", memory_skip=True)]
+        from ..member_profile import revise_fact
+        updated = revise_fact(member_openid, parts[0].strip(), parts[1].strip())
+        return [Reply(text="记忆已更新。" if updated else "没有找到唯一匹配的记忆。", memory_skip=True)]
     if content.strip().startswith(("/subscribe", "订阅")) and in_group:
         name = re.sub(r"^(?:/subscribe|订阅)\s*", "", content).strip()
         games = [normalize_game(x) for x in re.split(r"[,，、\s]+", name) if x]
-        if name in ("全部", "all"):
+        from ..themes import load_themes
+        from ..paths import EXTENSIONS_DIR
+        packages = load_themes(EXTENSIONS_DIR / "themes")
+        selected = next((theme for theme in packages if name in
+                         (theme.key, theme.label, *theme.config.get("aliases", []))), None)
+        themes = [selected.key] if selected else []
+        if selected or name in ("全部", "all"):
             games = []
         elif not games or any(x not in ("原神", "崩坏:星穹铁道", "绝区零", "崩坏3") for x in games):
-            return [Reply(text="请指定原神、崩铁、绝区零或全部。")]
+            return [Reply(text="请指定游戏、主题名称或全部。")]
         with session_scope() as s:
             group = s.query(QqGroup).filter_by(group_openid=openid).first()
             if group:
                 group.games = games
-        return [Reply(text="已订阅：" + ("、".join(games) or "全部游戏"))]
+                group.themes = themes
+        return [Reply(text="已订阅：" + (selected.label if selected else "、".join(games) or "全部资讯"))]
     text_mode = "文字版" in content or "用文字" in content
     state = ctx.get("state") or {}
     if text_mode and state.get("last_message_ids") and re.fullmatch(r"(?:改成|换成|用|发|给我)?文字版[。！!]?", content.strip()):
         from ..message_query import by_ids
-        return [Reply(text=_fmt_row(row)) for row in by_ids(state["last_message_ids"])][:MAX_REPLIES]
+        # 打包而非截断：上次查了 10 条时，文字版要完整给出（2026-09）
+        return _pack_text_replies(by_ids(state["last_message_ids"]))
     if content.strip() in ("上一条", "上一条爆料") and state.get("last_message_ids"):
         replies = [_row_reply(row) for row in by_ids(state["last_message_ids"][:1])]
-    elif re.fullmatch(r"(?:继续|接着看|再来)\s*(?:[1-5一二两三四五]\s*条)?[。！!]?", content.strip()) and state.get("last_message_ids"):
+    elif re.fullmatch(r"(?:继续|接着看|再来)\s*(?:(?:\d{1,3}|[一二两三四五六七八九十]+)\s*条)?[。！!]?", content.strip()) and state.get("last_message_ids"):
         from ..message_query import query, project, by_ids
         previous = by_ids(state["last_message_ids"])
         last = min(previous, key=lambda r: (r["published_at"] or datetime.min, r["id"])) if previous else None
@@ -721,7 +811,10 @@ async def _dispatch(content: str, openid: str, in_group: bool,
                 from sqlalchemy import or_, and_
                 q = q.filter(or_(MonitorMessage.published_at < last["published_at"],
                     and_(MonitorMessage.published_at == last["published_at"], MonitorMessage.id < last["id"])))
-            count = max(1, min(_requested_count(content, state.get("last_query_count") or 3), LATEST_MAX))
+            count = _requested_count(content, state.get("last_query_count") or 3) or 3
+            if count > LATEST_MAX:
+                return [_over_limit_reply()]
+            count = max(1, count)
             replies = [_row_reply(project(s, m)) for m in q.order_by(
                 MonitorMessage.published_at.desc(), MonitorMessage.id.desc()).limit(count)] or [Reply(text="没有更早的消息了。")]
     else:
@@ -743,28 +836,91 @@ async def _dispatch(content: str, openid: str, in_group: bool,
                         last_query_count=len(mids),
                         game=games[0] if len(games) == 1 else "")
     if text_mode:
-        return [Reply(text=_fmt_row(row), story_ids=[row["id"]]) for row in rows][:MAX_REPLIES]
-    from ..sharing import create_bundle, bundle_cards
+        # 打包而非截断：10 条上限后文字版按 MAX_TEXT 聚合（2026-09）
+        return _pack_text_replies(rows)
+    # 先回链接、后台补图（2026-09 超时复盘）：长图渲染 10-20s，放前台
+    # 必吃满 25s 处理守卫，超时降级分支的链接反而到不了群里。现在守卫内
+    # 只做 create_bundle（查库+内容去重，秒级）+ 取 URL，渲染挪到后台
+    # 任务，在 QQ 被动回复 5 分钟窗口内补发图片。
+    from ..sharing import create_bundle, bundle_url
+    from ..models import ShareToken
     sid = 0
     try:
         sid = await asyncio.to_thread(create_bundle, mids)
-        paths, url, _items = await asyncio.to_thread(bundle_cards, sid)
-        out = [Reply(kind="image", thumb_path=path, text=url if i == 0 else "",
-                     bundle_id=sid, story_ids=mids) for i, path in enumerate(paths[:4])]
-        if len(paths) > 4:
-            out.append(Reply(text=url, bundle_id=sid, story_ids=mids))
-        return out
+        with session_scope() as s:
+            url = bundle_url(s.get(ShareToken, sid))
     except Exception as exc:
-        logger.warning("生成爆料长图失败: %s", exc)
-        if sid:
-            from ..sharing import bundle_url
-            from ..models import ShareToken
-            with session_scope() as s:
-                try:
-                    return [Reply(text=bundle_url(s.get(ShareToken, sid)), bundle_id=sid, story_ids=mids)]
-                except ValueError:
-                    pass
+        logger.warning("生成分享链接失败: %s", exc)
         return [Reply(text="长图暂时无法生成，请稍后重试。")]
+    _schedule_bundle_cards(sid, mids, target=openid if in_group else member_openid,
+                           private=not in_group, msg_id=msg_id, bot=bot)
+    return [Reply(text=f"长图生成中，先看链接：\n{url}\n（图片稍后补发）",
+                  bundle_id=sid, story_ids=mids)]
+
+
+# 后台补发任务的强引用：asyncio.create_task 只持弱引用，不存会被 GC 中断
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_bundle_cards(sid: int, mids: list[int], *, target: str,
+                           private: bool, msg_id: str,
+                           bot: dict | None) -> None:
+    """长图后台渲染 + 补发。失败只记日志 —— 链接已回群，图丢了不影响使用。
+
+    - 渲染（to_thread）不占事件循环，不碰 25s 守卫
+    - 投递 key 在 msg_id 后拼后缀：与首条链接文本的 parts 状态分开，
+      复用 send_parts 的状态机保证幂等（重试/桥重连不重发）
+    - msg_id 为空（本地直调/单测）不启动：没有被动回复窗口，补不出去
+    """
+    if not target or not msg_id:
+        return
+    from ..conversation_scope import reply_deadline, bot_identity
+    deadline = reply_deadline.get()
+    if deadline:
+        from ..jobs import enqueue
+        key = f"cards:{bot_identity(bot)}:{target}:{msg_id}"
+        enqueue("qq_cards", key, {"sid": sid, "mids": mids, "target": target,
+            "private": private, "msg_id": msg_id, "bot_id": (bot or {}).get("id"),
+            "app_id": (bot or {}).get("app_id"), "deadline": deadline.isoformat()})
+        return
+
+    async def _deliver() -> None:
+        from ..sharing import bundle_cards
+        from .sending import send_parts
+        paths, _url, _items = await asyncio.to_thread(bundle_cards, sid)
+        if not paths or not msg_id:
+            return
+        from . import events
+        # 被动回复 5 次上限：首条链接文本已占 msg_seq=1，图片最多
+        # 4 条（seq 2-5）。seq 必须接着编 —— 从 1 重开会与首条冲突，
+        # 被平台按 (msg_id, msg_seq) 去重丢弃（2026-09 群里只收到
+        # 尾部页的根因）。超过 4 页走链接看（首条已发过链接）。
+        replies = [Reply(kind="image", thumb_path=p, bundle_id=sid, story_ids=mids)
+                   for p in paths[:4]]
+        if not replies:
+            return
+        from ..conversation_scope import bot_identity
+        key = events.event_key("c2c" if private else "group", target, f"{msg_id}:cards",
+                               bot_identity(bot))
+        await send_parts(target, replies, key=key, private=private,
+                         msg_id=msg_id, bot=bot, seq_start=2)
+
+    async def _run() -> None:
+        # 270s 上限：给渲染+上传留余量，又不越出被动回复 5 分钟窗口
+        try:
+            await asyncio.wait_for(_deliver(), timeout=270)
+        except asyncio.TimeoutError:
+            logger.warning("长图后台补发超时（被动窗口 5 分钟）sid=%s", sid)
+        except Exception as exc:
+            logger.warning("长图后台补发失败 sid=%s: %s", sid, exc)
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:  # 无运行中事件循环（理论到不了，防御）
+        logger.warning("无事件循环，跳过长图后台补发 sid=%s", sid)
+        return
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 def _record_inbound(event_type: str, group_openid: str, member_openid: str,
@@ -782,50 +938,68 @@ def _record_inbound(event_type: str, group_openid: str, member_openid: str,
         logger.warning("入站留痕失败: %s", e)
 
 
-async def handle_group_message(d: dict) -> tuple[list[Reply], str]:
+async def handle_group_message(d: dict, bot: dict | None = None) -> tuple[list[Reply], str]:
     """群 @ 消息 → (回复列表, 被动回复用 msg_id)。"""
     openid = str(d.get("group_openid") or "")
     member = str((d.get("author") or {}).get("member_openid") or "")
     msg_id = str(d.get("id") or "")
     content = _clean_content(str(d.get("content") or ""))
     from . import events
-    key, fresh, cached = events.claim("group", openid, msg_id)
+    from ..conversation_scope import activate, bot_identity
+    key, fresh, cached = events.claim("group", openid, msg_id, bot_identity(bot))
     if not fresh:
         return [Reply(**row) for row in cached], msg_id
     try:
-        replies = await asyncio.wait_for(
-            _dispatch(content, openid, in_group=True, member_openid=member), timeout=25)
+        with activate(bot, openid, member, msg_id):
+            from ..member_profile import capture_explicit
+            capture_explicit(member, content, msg_id)
+            replies = await asyncio.wait_for(
+                _dispatch(content, openid, in_group=True, member_openid=member,
+                          msg_id=msg_id, bot=bot), timeout=25)
     except asyncio.TimeoutError:
         replies = [Reply(text="处理超时了，缩小问题范围或稍后再试。")]
     except Exception:
         logger.exception("群消息处理失败")
         replies = [Reply(text="暂时无法处理这条消息，请稍后重试。")]
     events.finish(key, replies)
-    _record_conversation(openid, member, content, replies, msg_id)
+    with activate(bot, openid, member, msg_id):
+        if not any(r.memory_skip for r in replies):
+            from ..memory import record_turn
+            record_turn(openid, member, "user", content, event_id=msg_id,
+                        reply_to=str((d.get("message_reference") or {}).get("message_id") or ""))
     _record_inbound("GROUP_AT_MESSAGE_CREATE", openid, member,
                     content, msg_id, replies_text(replies))
     return replies, msg_id
 
 
-async def handle_c2c_message(d: dict) -> tuple[list[Reply], str]:
+async def handle_c2c_message(d: dict, bot: dict | None = None) -> tuple[list[Reply], str]:
     """C2C 私聊消息 → (回复列表, 被动回复用 msg_id)。"""
     openid = str((d.get("author") or {}).get("user_openid") or "")
     msg_id = str(d.get("id") or "")
     content = _clean_content(str(d.get("content") or ""))
     from . import events
-    key, fresh, cached = events.claim("c2c", openid, msg_id)
+    from ..conversation_scope import activate, bot_identity
+    key, fresh, cached = events.claim("c2c", openid, msg_id, bot_identity(bot))
     if not fresh:
         return [Reply(**row) for row in cached], msg_id
     try:
-        replies = await asyncio.wait_for(
-            _dispatch(content, "", in_group=False, member_openid=openid), timeout=25)
+        with activate(bot, "", openid, msg_id):
+            from ..member_profile import capture_explicit
+            capture_explicit(openid, content, msg_id)
+            replies = await asyncio.wait_for(
+                _dispatch(content, "", in_group=False, member_openid=openid,
+                          msg_id=msg_id, bot=bot), timeout=25)
     except asyncio.TimeoutError:
         replies = [Reply(text="处理超时了，稍后再试。")]
     except Exception:
         logger.exception("私聊消息处理失败")
         replies = [Reply(text="暂时无法处理这条消息，请稍后重试。")]
     events.finish(key, replies)
-    _record_conversation("", openid, content, replies, msg_id)
+    with activate(bot, "", openid, msg_id):
+        if not any(r.memory_skip for r in replies):
+            from ..memory import record_turn
+            record_turn("", openid, "user", content, event_id=msg_id,
+                        reply_to=str((d.get("message_reference") or {}).get("message_id") or ""))
     _record_inbound("C2C_MESSAGE_CREATE", "", openid, content, msg_id,
                     replies_text(replies))
     return replies, msg_id
