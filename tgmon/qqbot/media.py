@@ -295,7 +295,11 @@ async def cleanup_github_relay(max_age_days: int = 1) -> int:
                 for f in r2.json():
                     if f.get("type") != "file":
                         continue
-                    r3 = await c.delete(
+                    # httpx 0.28 removed the ``json`` keyword from the
+                    # convenience ``delete`` method; use request() so the
+                    # cleanup keeps working across supported httpx versions.
+                    r3 = await c.request(
+                        "DELETE",
                         f"{GITHUB_API}/repos/{repo}/contents/{RELAY_DIR}/{name}/{f['name']}",
                         json={"message": f"cleanup {name}/{f['name']}",
                               "sha": f["sha"], "branch": "main"},
