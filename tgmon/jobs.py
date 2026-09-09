@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 import uuid
 from datetime import datetime, timedelta
 
@@ -12,6 +13,12 @@ from sqlalchemy.dialects.sqlite import insert
 
 from .db import session_scope
 from .models import ProcessingJob, SourceEvent
+
+
+# Several worker queues claim jobs from the same SQLite database. Serialize
+# the short claim/recovery transaction inside one worker process so competing
+# lease updates never hold RESERVED locks against one another.
+_claim_lock = threading.Lock()
 
 
 def enqueue(queue: str, key: str, payload: dict, *, delay: float = 0, session=None,
@@ -30,27 +37,28 @@ def enqueue(queue: str, key: str, payload: dict, *, delay: float = 0, session=No
 
 
 def claim(queue: str, *, lease_seconds: int = 120) -> dict | None:
-    now, owner = datetime.utcnow(), uuid.uuid4().hex
-    with session_scope() as s:
-        recover(s, now)
-        from sqlalchemy import exists, and_
-        from sqlalchemy.orm import aliased
-        prior = aliased(ProcessingJob)
-        candidate = select(ProcessingJob.id).where(
-            ProcessingJob.queue == queue, ProcessingJob.status.in_(("pending", "retry")),
-            ProcessingJob.available_at <= now,
-            or_(ProcessingJob.scope_key.is_(None), ~exists(select(prior.id).where(
-                prior.scope_key == ProcessingJob.scope_key, prior.queue == queue,
-                prior.id < ProcessingJob.id, prior.status.in_(("pending", "retry", "running")))))
-            ).order_by(
-            ProcessingJob.available_at, ProcessingJob.id).limit(1).scalar_subquery()
-        row = s.execute(update(ProcessingJob).where(ProcessingJob.id == candidate).values(
-            status="running", owner=owner, lease_until=now + timedelta(seconds=lease_seconds),
-            attempts=ProcessingJob.attempts + 1, updated_at=now).returning(
-            ProcessingJob.id, ProcessingJob.queue, ProcessingJob.payload,
-            ProcessingJob.attempts)).first()
-        return {"id": row.id, "queue": row.queue, "payload": row.payload,
-                "attempts": row.attempts, "owner": owner} if row else None
+    with _claim_lock:
+        now, owner = datetime.utcnow(), uuid.uuid4().hex
+        with session_scope() as s:
+            recover(s, now)
+            from sqlalchemy import exists
+            from sqlalchemy.orm import aliased
+            prior = aliased(ProcessingJob)
+            candidate = select(ProcessingJob.id).where(
+                ProcessingJob.queue == queue, ProcessingJob.status.in_(("pending", "retry")),
+                ProcessingJob.available_at <= now,
+                or_(ProcessingJob.scope_key.is_(None), ~exists(select(prior.id).where(
+                    prior.scope_key == ProcessingJob.scope_key, prior.queue == queue,
+                    prior.id < ProcessingJob.id, prior.status.in_(("pending", "retry", "running")))))
+                ).order_by(
+                ProcessingJob.available_at, ProcessingJob.id).limit(1).scalar_subquery()
+            row = s.execute(update(ProcessingJob).where(ProcessingJob.id == candidate).values(
+                status="running", owner=owner, lease_until=now + timedelta(seconds=lease_seconds),
+                attempts=ProcessingJob.attempts + 1, updated_at=now).returning(
+                ProcessingJob.id, ProcessingJob.queue, ProcessingJob.payload,
+                ProcessingJob.attempts)).first()
+            return {"id": row.id, "queue": row.queue, "payload": row.payload,
+                    "attempts": row.attempts, "owner": owner} if row else None
 
 
 def recover(s, now: datetime) -> int:

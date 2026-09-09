@@ -513,7 +513,7 @@ class WorkerRunner:
             asyncio.create_task(maintenance_loop(self._exit)),
             asyncio.create_task(extension_runtime.poll_sources()),
         ]
-        for queue in ("ingest", "source", "media", "media", "archive", "translate", "translate", "publish"):
+        for queue in ("ingest", "source", "media", "archive", "translate", "publish"):
             jobs.append(asyncio.create_task(self._processing_loop(queue)))
         try:
             await self._exit.wait()
